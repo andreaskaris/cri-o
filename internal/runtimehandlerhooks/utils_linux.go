@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -103,13 +104,36 @@ func isAllBitSet(in []byte) bool {
 	return true
 }
 
-// UpdateIRQSmpAffinityMask take input cpus that need to change irq affinity mask and
-// the current mask string, return an update mask string and inverted mask, with those cpus
-// enabled or disable in the mask.
-func UpdateIRQSmpAffinityMask(cpus, current string, set bool) (cpuMask, bannedCPUMask string, err error) {
+// UpdateIRQSmpAffinityMask takes:
+//   - The container's input cpus.
+//   - The current system irq affinity mask.
+//   - The set boolean which indicates if IRQs should be enabled (true) or disabled (false).
+//   - Optionally a set of CPUs where IRQs should be left untouched - this list is relative to the absolute CPU numbers,
+//     thus if the container runs on CPUs 4,6,8,10 and ignoreCPUs is 1-2, absolute CPU numbers 6 and 8 would be ignored.
+//
+// It returns an updated mask string and inverted mask, with either CPUs enabled or disable in the mask.
+func UpdateIRQSmpAffinityMask(cpus, current string, set bool, ignoreCPUs *cpuset.CPUSet) (cpuMask, bannedCPUMask string, err error) {
 	podcpuset, err := cpuset.Parse(cpus)
 	if err != nil {
 		return cpus, "", err
+	}
+	if ignoreCPUs != nil {
+		// ignoreList is sorted. The last, highest element must be smaller than len(podcpuset).
+		ignoreList := ignoreCPUs.List()
+		podcpuList := podcpuset.List()
+		ignoreListMax := ignoreList[len(ignoreList)-1]
+		if ignoreListMax >= len(podcpuList) {
+			return cpus, "", fmt.Errorf("highest irq-load-balancing CPU (%d) is larger than highest permissible "+
+				"relative container CPU (%d)",
+				ignoreListMax, len(podcpuList)-1)
+		}
+		var newCPUSet []int
+		for i, cpu := range podcpuList {
+			if !slices.Contains(ignoreList, i) {
+				newCPUSet = append(newCPUSet, cpu)
+			}
+		}
+		podcpuset = cpuset.New(newCPUSet...)
 	}
 
 	// only ascii string supported

@@ -12,6 +12,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/utils/cpuset"
 
 	"github.com/cri-o/cri-o/internal/hostport"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
@@ -58,8 +59,9 @@ var _ = Describe("high_performance_hooks", func() {
 	Describe("setIRQLoadBalancingUsingDaemonCommand", func() {
 		irqSmpAffinityFile := filepath.Join(fixturesDir, "irq_smp_affinity")
 		irqBalanceConfigFile := filepath.Join(fixturesDir, "irqbalance")
-		verifySetIRQLoadBalancing := func(enabled bool, expected string) {
-			err := setIRQLoadBalancing(context.TODO(), container, enabled, irqSmpAffinityFile, irqBalanceConfigFile)
+		verifySetIRQLoadBalancing := func(enabled bool, expected string, ignoreCPUs *cpuset.CPUSet) {
+			err := setIRQLoadBalancing(context.TODO(), container, enabled, ignoreCPUs, irqSmpAffinityFile,
+				irqBalanceConfigFile)
 			Expect(err).ToNot(HaveOccurred())
 
 			content, err := os.ReadFile(irqSmpAffinityFile)
@@ -93,7 +95,7 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should set the irq bit mask", func() {
-				verifySetIRQLoadBalancing(true, "00000000,00003033")
+				verifySetIRQLoadBalancing(true, "00000000,00003033", nil)
 			})
 		})
 
@@ -103,7 +105,19 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should clear the irq bit mask", func() {
-				verifySetIRQLoadBalancing(false, "00000000,00003003")
+				verifySetIRQLoadBalancing(false, "00000000,00003003", nil)
+			})
+		})
+
+		Context("with enabled equals to false and cpu ignore list specified", func() {
+			BeforeEach(func() {
+				flags = "00000000,00003033"
+			})
+
+			// Disable IRQ load-balancing on the first container CPU only, do not change it on the last container CPU
+			// (= keep it enabled).
+			It("should clear the irq bit mask", func() {
+				verifySetIRQLoadBalancing(false, "00000000,00003023", cpusetPointer(1))
 			})
 		})
 	})
@@ -112,7 +126,7 @@ var _ = Describe("high_performance_hooks", func() {
 		irqSmpAffinityFile := filepath.Join(fixturesDir, "irq_smp_affinity")
 		irqBalanceConfigFile := filepath.Join(fixturesDir, "irqbalance")
 		verifySetIRQLoadBalancing := func(enabled bool, expectedSmp, expectedBan string) {
-			err = setIRQLoadBalancing(context.TODO(), container, enabled, irqSmpAffinityFile, irqBalanceConfigFile)
+			err = setIRQLoadBalancing(context.TODO(), container, enabled, nil, irqSmpAffinityFile, irqBalanceConfigFile)
 			Expect(err).ToNot(HaveOccurred())
 
 			content, err := os.ReadFile(irqSmpAffinityFile)

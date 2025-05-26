@@ -139,10 +139,10 @@ func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s
 	}
 
 	// disable the IRQ smp load balancing for the container CPUs
-	if shouldIRQLoadBalancingBeDisabled(ctx, s.Annotations()) {
+	if disable, ignoreCPUs := shouldIRQLoadBalancingBeDisabled(ctx, s.Annotations()); disable {
 		log.Infof(ctx, "Disable irq smp balancing for container %q", c.ID())
 
-		if err := setIRQLoadBalancing(ctx, c, false, IrqSmpAffinityProcFile, h.irqBalanceConfigFile); err != nil {
+		if err := setIRQLoadBalancing(ctx, c, false, ignoreCPUs, IrqSmpAffinityProcFile, h.irqBalanceConfigFile); err != nil {
 			return fmt.Errorf("set IRQ load balancing: %w", err)
 		}
 	}
@@ -195,8 +195,8 @@ func (h *HighPerformanceHooks) PreStop(ctx context.Context, c *oci.Container, s 
 	}
 
 	// enable the IRQ smp balancing for the container CPUs
-	if shouldIRQLoadBalancingBeDisabled(ctx, s.Annotations()) {
-		if err := setIRQLoadBalancing(ctx, c, true, IrqSmpAffinityProcFile, h.irqBalanceConfigFile); err != nil {
+	if disable, _ := shouldIRQLoadBalancingBeDisabled(ctx, s.Annotations()); disable {
+		if err := setIRQLoadBalancing(ctx, c, true, nil, IrqSmpAffinityProcFile, h.irqBalanceConfigFile); err != nil {
 			return fmt.Errorf("set IRQ load balancing: %w", err)
 		}
 	}
@@ -264,13 +264,19 @@ func shouldCPUQuotaBeDisabled(ctx context.Context, annotations fields.Set) bool 
 		annotations[crioannotations.CPUQuotaAnnotation] == annotationDisable
 }
 
-func shouldIRQLoadBalancingBeDisabled(ctx context.Context, annotations fields.Set) bool {
+// shouldIRQLoadBalancingBeDisabled parses annotation irq-load-balancing.crio.io. If it is set to "disabled" or "true",
+// return true, nil. If it contains a valid CPUSet, return True, CPUSet. Otherwise, return false, nil.
+func shouldIRQLoadBalancingBeDisabled(ctx context.Context, annotations fields.Set) (bool, *cpuset.CPUSet) {
 	if annotations[crioannotations.IRQLoadBalancingAnnotation] == annotationTrue {
 		log.Warnf(ctx, "%s", annotationValueDeprecationWarning(crioannotations.IRQLoadBalancingAnnotation))
 	}
 
+	if cpuset, err := cpuset.Parse(annotations[crioannotations.IRQLoadBalancingAnnotation]); err == nil {
+		return true, &cpuset
+	}
+
 	return annotations[crioannotations.IRQLoadBalancingAnnotation] == annotationTrue ||
-		annotations[crioannotations.IRQLoadBalancingAnnotation] == annotationDisable
+		annotations[crioannotations.IRQLoadBalancingAnnotation] == annotationDisable, nil
 }
 
 func shouldCStatesBeConfigured(annotations fields.Set) (present bool, value string) {
@@ -569,7 +575,7 @@ func disableCPULoadBalancingV1(containerManagers []cgroups.Manager) error {
 	return nil
 }
 
-func setIRQLoadBalancing(ctx context.Context, c *oci.Container, enable bool, irqSmpAffinityFile, irqBalanceConfigFile string) error {
+func setIRQLoadBalancing(ctx context.Context, c *oci.Container, enable bool, ignoreCPUs *cpuset.CPUSet, irqSmpAffinityFile, irqBalanceConfigFile string) error {
 	lspec := c.Spec().Linux
 	if lspec == nil ||
 		lspec.Resources == nil ||
@@ -577,7 +583,6 @@ func setIRQLoadBalancing(ctx context.Context, c *oci.Container, enable bool, irq
 		lspec.Resources.CPU.Cpus == "" {
 		return fmt.Errorf("find container %s CPUs", c.ID())
 	}
-
 	content, err := os.ReadFile(irqSmpAffinityFile)
 	if err != nil {
 		return err
@@ -585,7 +590,8 @@ func setIRQLoadBalancing(ctx context.Context, c *oci.Container, enable bool, irq
 
 	currentIRQSMPSetting := strings.TrimSpace(string(content))
 
-	newIRQSMPSetting, newIRQBalanceSetting, err := UpdateIRQSmpAffinityMask(lspec.Resources.CPU.Cpus, currentIRQSMPSetting, enable)
+	newIRQSMPSetting, newIRQBalanceSetting, err := UpdateIRQSmpAffinityMask(
+		lspec.Resources.CPU.Cpus, currentIRQSMPSetting, enable, ignoreCPUs)
 	if err != nil {
 		return err
 	}

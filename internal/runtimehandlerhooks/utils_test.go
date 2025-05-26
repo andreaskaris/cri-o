@@ -7,18 +7,21 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"k8s.io/utils/cpuset"
 )
 
 var _ = Describe("Utils", func() {
 	Describe("UpdateIRQSmpAffinityMask", func() {
 		type Input struct {
-			cpus string
-			mask string
-			set  bool
+			cpus       string
+			mask       string
+			set        bool
+			ignoreCPUs *cpuset.CPUSet
 		}
 		type Expected struct {
 			mask    string
 			invMask string
+			err     error
 		}
 		type TestData struct {
 			input    Input
@@ -27,7 +30,11 @@ var _ = Describe("Utils", func() {
 
 		DescribeTable("testing cpu mask",
 			func(c TestData) {
-				mask, invMask, err := UpdateIRQSmpAffinityMask(c.input.cpus, c.input.mask, c.input.set)
+				mask, invMask, err := UpdateIRQSmpAffinityMask(c.input.cpus, c.input.mask, c.input.set, c.input.ignoreCPUs)
+				if c.expected.err != nil {
+					Expect(err).To(MatchError(c.expected.err))
+					return
+				}
 				Expect(err).ToNot(HaveOccurred())
 				Expect(mask).To(Equal(c.expected.mask))
 				Expect(invMask).To(Equal(c.expected.invMask))
@@ -55,6 +62,19 @@ var _ = Describe("Utils", func() {
 			Entry("clear two bits from a short mask", TestData{
 				input:    Input{cpus: "2-3", mask: "ffffff", set: false},
 				expected: Expected{mask: "00fffff3", invMask: "0000000c"},
+			}),
+			Entry("clear a set of bits with ignore list", TestData{
+				input:    Input{cpus: "4-13", mask: "ffff,ffffffff", set: false, ignoreCPUs: cpusetPointer(8, 9)},
+				expected: Expected{mask: "0000ffff,fffff00f", invMask: "00000000,00000ff0"},
+			}),
+			Entry("set a set of bits with ignore list", TestData{
+				input:    Input{cpus: "4-13", mask: "ffff,ffffc00f", set: true, ignoreCPUs: cpusetPointer(0, 4)},
+				expected: Expected{mask: "0000ffff,fffffeef", invMask: "00000000,00000110"},
+			}),
+			Entry("clear a set of bits with ignore list and trigger error", TestData{
+				input: Input{cpus: "4-13", mask: "ffff,ffffffff", set: false, ignoreCPUs: cpusetPointer(9, 10)},
+				expected: Expected{err: fmt.Errorf("highest irq-load-balancing CPU (10) is larger than highest " +
+					"permissible relative container CPU (9)")},
 			}),
 		)
 
@@ -151,3 +171,8 @@ const confTemplate = `# irqbalance is a daemon process that distributes interrup
 
 IRQBALANCE_BANNED_CPUS=
 `
+
+func cpusetPointer(cpus ...int) *cpuset.CPUSet {
+	c := cpuset.New(cpus...)
+	return &c
+}

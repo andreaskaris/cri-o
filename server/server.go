@@ -92,6 +92,9 @@ type Server struct {
 
 	// NRI runtime interface
 	nri *nriAPI
+	// runtimeHandlerHooks holds the runtime handler hooks for each registered runtime.
+	runtimeHandlerHooks  map[string]runtimehandlerhooks.RuntimeHandlerHooks
+	highPerformanceHooks *runtimehandlerhooks.HighPerformanceHooks
 }
 
 // pullArguments are used to identify a pullOperation via an input image name and
@@ -385,6 +388,22 @@ func getIDMappings(config *libconfig.Config) (*idtools.IDMappings, error) {
 	return idtools.NewIDMappingsFromMaps(parsedUIDsMappings, parsedGIDsMappings), nil
 }
 
+func (s *Server) getRuntimeHandlerPerfHooks(ctx context.Context, runtimeHandler string, annotations map[string]string) runtimehandlerhooks.RuntimeHandlerHooks {
+	if runtimehandlerhooks.HighPerformanceAnnotationsSpecified(annotations) ||
+		strings.Contains(runtimeHandler, runtimehandlerhooks.HighPerformance) {
+		if s.highPerformanceHooks == nil {
+			log.Warnf(ctx, "The usage of the handler %q without adding high-performance feature annotations under "+
+				"allowed_annotations will be deprecated under 1.21", runtimehandlerhooks.HighPerformance)
+			s.highPerformanceHooks = runtimehandlerhooks.New(s.config.IrqBalanceConfigFile, s.config.SharedCPUSet)
+		}
+		return s.highPerformanceHooks
+	}
+	if runtimehandlerhooks.CPULoadBalancingAllowed(&s.config) {
+		return &runtimehandlerhooks.DefaultCPULoadBalanceHooks{}
+	}
+	return nil
+}
+
 // New creates a new Server with the provided context and configuration.
 func New(
 	ctx context.Context,
@@ -461,6 +480,7 @@ func New(
 		minimumMappableGID:       config.MinimumMappableGID,
 		pullOperationsInProgress: make(map[pullArguments]*pullOperation),
 		resourceStore:            resourcestore.New(),
+		runtimeHandlerHooks:      make(map[string]runtimehandlerhooks.RuntimeHandlerHooks),
 	}
 	if s.config.EnablePodEvents {
 		// creating a container events channel only if the evented pleg is enabled
@@ -884,10 +904,8 @@ func (s *Server) handleExit(ctx context.Context, event fsnotify.Event) {
 		}
 	}
 
-	hooks, err := runtimehandlerhooks.GetRuntimeHandlerHooks(ctx, &s.config, sb.RuntimeHandler(), sb.Annotations())
-	if err != nil {
-		log.Warnf(ctx, "Failed to get runtime handler %q hooks", sb.RuntimeHandler())
-	} else if hooks != nil {
+	hooks := s.getRuntimeHandlerPerfHooks(ctx, sb.RuntimeHandler(), sb.Annotations())
+	if hooks != nil {
 		if err := hooks.PostStop(ctx, c, sb); err != nil {
 			log.Errorf(ctx, "Failed to run post-stop hook for container %s: %v", c.ID(), err)
 		}

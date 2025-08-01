@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/opencontainers/cgroups"
 	"github.com/opencontainers/cgroups/manager"
@@ -66,6 +67,7 @@ const (
 type ServiceManager interface {
 	IsServiceEnabled(serviceName string) bool
 	RestartService(serviceName string) error
+	ResetFailedService(serviceName string) error
 }
 
 // CommandRunner interface for running external commands.
@@ -85,6 +87,10 @@ func (d *defaultServiceManager) RestartService(serviceName string) error {
 	return restartService(serviceName)
 }
 
+func (d *defaultServiceManager) ResetFailedService(serviceName string) error {
+	return resetFailedService(serviceName)
+}
+
 type defaultCommandRunner struct{}
 
 func (d *defaultCommandRunner) LookPath(file string) (string, error) {
@@ -100,19 +106,47 @@ func (d *defaultCommandRunner) RunCommand(name string, env []string, arg ...stri
 	return cmd.Run()
 }
 
-var (
-	serviceManager ServiceManager = &defaultServiceManager{}
-	commandRunner  CommandRunner  = &defaultCommandRunner{}
-)
-
 // HighPerformanceHooks used to run additional hooks that will configure a system for the latency sensitive workloads.
 type HighPerformanceHooks struct {
-	irqBalanceConfigFile     string
-	cpusetLock               sync.Mutex
-	updateIRQSMPAffinityLock sync.Mutex
-	sharedCPUs               string
-	execCPUAffinity          config.ExecCPUAffinityType
-	irqSMPAffinityFile       string
+	irqBalanceConfigFile      string
+	cpusetLock                sync.Mutex
+	updateIRQSMPAffinityLock  sync.Mutex
+	sharedCPUs                string
+	execCPUAffinity           config.ExecCPUAffinityType
+	irqSMPAffinityFile        string
+	irqBalanceRestartRequired chan struct{}
+	serviceManager            ServiceManager
+	commandRunner             CommandRunner
+}
+
+func NewHighPerformanceHooks(ctx context.Context,
+	irqBalanceConfigFile, sharedCPUs, irqSMPAffinityFile string,
+	execCPUAffinity config.ExecCPUAffinityType,
+	serviceManager ServiceManager, commandRunner CommandRunner,
+) *HighPerformanceHooks {
+	if serviceManager == nil {
+		serviceManager = &defaultServiceManager{}
+	}
+
+	if commandRunner == nil {
+		commandRunner = &defaultCommandRunner{}
+	}
+
+	highPerformanceHooks := &HighPerformanceHooks{
+		irqBalanceConfigFile:      irqBalanceConfigFile,
+		cpusetLock:                sync.Mutex{},
+		updateIRQSMPAffinityLock:  sync.Mutex{},
+		sharedCPUs:                sharedCPUs,
+		irqSMPAffinityFile:        irqSMPAffinityFile,
+		execCPUAffinity:           execCPUAffinity,
+		irqBalanceRestartRequired: make(chan struct{}),
+		serviceManager:            serviceManager,
+		commandRunner:             commandRunner,
+	}
+
+	go highPerformanceHooks.processIRQBalanceRestarts(ctx)
+
+	return highPerformanceHooks
 }
 
 func (h *HighPerformanceHooks) PreCreate(ctx context.Context, specgen *generate.Generator, s *sandbox.Sandbox, c *oci.Container) error {
@@ -677,27 +711,59 @@ func (h *HighPerformanceHooks) setIRQLoadBalancing(ctx context.Context, c *oci.C
 	if err := h.updateNewIRQSMPAffinityMask(ctx, c.Name(), lspec.Resources.CPU.Cpus, enable); err != nil {
 		return err
 	}
-	// Outside of the lock section, we can restart the irqbalance service or run irqbalance --oneshot command.
-	// handleIRQBalanceRestart will log errors but will not return them, as it is not critical for the pod to start.
-	h.handleIRQBalanceRestart(ctx, c.Name())
+
+	// Register that we must restart irqbalance. Do not block if this was already sent to the channel.
+	// go func processIRQBalanceRestarts will then handle the service restart (with a debounce).
+	select {
+	case h.irqBalanceRestartRequired <- struct{}{}:
+	default:
+	}
 
 	return nil
 }
 
-// handleIRQBalanceRestart handles - outside of the lock section - the restart of the irqbalance service or runs
+// processIRQBalanceRestarts restarts IRQBalance / irq oneshot service at most once every 100ms.
+func (h *HighPerformanceHooks) processIRQBalanceRestarts(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.irqBalanceRestartRequired:
+			// Debounce for 100 milliseconds.
+			time.Sleep(100 * time.Millisecond)
+			// In the last 100 ms, we might have received another request for
+			// restart required. Remove from the channel and ignore.
+			select {
+			case <-h.irqBalanceRestartRequired:
+				// Drain additional signal that came in over the last 100 ms.
+			default:
+			}
+
+			h.handleIRQBalanceRestart(ctx)
+		}
+	}
+}
+
+// handleIRQBalanceRestart handles - without locks - the restart of the irqbalance service or runs
 // irqbalance --oneshot command if the service is not enabled. The environment variable for irqbalance oneshot
 // is read from h.irqBalanceConfigFile (/etc/sysconfig/irqbalance) which is guaranteed to be in a consistent state
 // after the lock section in updateNewIRQSMPAffinityMask.
-func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cName string) {
+func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context) {
 	// Nothing else to do if irq balance config file does not exist.
 	if !fileExists(h.irqBalanceConfigFile) {
 		return
 	}
 
-	if serviceManager.IsServiceEnabled(irqBalancedName) {
-		log.Debugf(ctx, "Container %q restarting irqbalance service", cName)
+	if h.serviceManager.IsServiceEnabled(irqBalancedName) {
+		log.Debugf(ctx, "Restarting irqbalance service")
 
-		if err := serviceManager.RestartService(irqBalancedName); err != nil {
+		// Reset the systemd counters for the service. Otherwise, we might run into a rate limit due to
+		// systemd's StartLimit* which is 5 restarts per 10 seconds.
+		if err := h.serviceManager.ResetFailedService(irqBalancedName); err != nil {
+			log.Warnf(ctx, "Failed to reset irqbalance service failure state: %v", err)
+		}
+
+		if err := h.serviceManager.RestartService(irqBalancedName); err != nil {
 			log.Warnf(ctx, "Irqbalance service restart failed: %v", err)
 		}
 
@@ -705,7 +771,7 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 	}
 
 	// Handle irqbalance --oneshot below.
-	irqBalanceFullPath, err := commandRunner.LookPath(irqBalancedName)
+	irqBalanceFullPath, err := h.commandRunner.LookPath(irqBalancedName)
 	if err != nil {
 		// irqbalance is not installed, skip the rest; pod should still start, so return nil instead.
 		log.Warnf(ctx, "Irqbalance binary not found: %v", err)
@@ -732,15 +798,15 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 		text = strings.Trim(text, "\"'")
 		env := fmt.Sprintf("%s=%s", irqBalanceBannedCpus, text)
 
-		log.Debugf(ctx, "Container %q running '%s %s %s'", cName, env, irqBalanceFullPath, "--oneshot")
+		log.Debugf(ctx, "Running '%s %s %s'", env, irqBalanceFullPath, "--oneshot")
 
-		if err := commandRunner.RunCommand(
+		if err := h.commandRunner.RunCommand(
 			irqBalanceFullPath,
 			[]string{env},
 			"--oneshot",
 		); err != nil {
-			log.Warnf(ctx, "Container %q failed to run '%s %s %s', err: %q",
-				cName, env, irqBalanceFullPath, "--oneshot", err)
+			log.Warnf(ctx, "Failed to run '%s %s %s', err: %q",
+				env, irqBalanceFullPath, "--oneshot", err)
 		}
 
 		return
@@ -1203,8 +1269,8 @@ func RestoreIrqBalanceConfig(ctx context.Context, irqBalanceConfigFile, irqBanne
 		return err
 	}
 
-	if serviceManager.IsServiceEnabled(irqBalancedName) {
-		if err := serviceManager.RestartService(irqBalancedName); err != nil {
+	if isServiceEnabled(irqBalancedName) {
+		if err := restartService(irqBalancedName); err != nil {
 			log.Warnf(ctx, "Irqbalance service restart failed: %v", err)
 		}
 	}

@@ -159,6 +159,10 @@ func restartService(serviceName string) error {
 	return cmdrunner.Command("systemctl", "restart", serviceName).Run()
 }
 
+func resetFailedService(serviceName string) error {
+	return cmdrunner.Command("systemctl", "reset-failed", serviceName).Run()
+}
+
 func isServiceEnabled(serviceName string) bool {
 	cmd := cmdrunner.Command("systemctl", "is-enabled", serviceName)
 

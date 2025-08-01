@@ -3,7 +3,6 @@ package runtimehandlerhooks
 import (
 	"context"
 	"strings"
-	"sync"
 
 	"github.com/cri-o/cri-o/internal/log"
 	crioann "github.com/cri-o/cri-o/pkg/annotations"
@@ -51,14 +50,15 @@ func (hr *HooksRetriever) Get(ctx context.Context, runtimeName string, sandboxAn
 		}
 
 		if hr.highPerformanceHooks == nil {
-			hr.highPerformanceHooks = &HighPerformanceHooks{
-				irqBalanceConfigFile:     hr.config.IrqBalanceConfigFile,
-				cpusetLock:               sync.Mutex{},
-				updateIRQSMPAffinityLock: sync.Mutex{},
-				sharedCPUs:               hr.config.SharedCPUSet,
-				irqSMPAffinityFile:       IrqSmpAffinityProcFile,
-				execCPUAffinity:          runtimeConfig.ExecCPUAffinity,
-			}
+			hr.highPerformanceHooks = NewHighPerformanceHooks(
+				ctx,
+				hr.config.IrqBalanceConfigFile,
+				hr.config.SharedCPUSet,
+				IrqSmpAffinityProcFile,
+				runtimeConfig.ExecCPUAffinity,
+				&defaultServiceManager{},
+				&defaultCommandRunner{},
+			)
 		}
 
 		return hr.highPerformanceHooks

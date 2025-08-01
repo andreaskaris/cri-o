@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/opencontainers/cgroups"
 	"github.com/opencontainers/cgroups/manager"
@@ -65,6 +66,7 @@ const (
 type ServiceManager interface {
 	IsServiceEnabled(serviceName string) bool
 	RestartService(serviceName string) error
+	ResetFailedService(serviceName string) error
 }
 
 // CommandRunner interface for running external commands.
@@ -84,6 +86,10 @@ func (d *defaultServiceManager) RestartService(serviceName string) error {
 	return restartService(serviceName)
 }
 
+func (d *defaultServiceManager) ResetFailedService(serviceName string) error {
+	return resetFailedService(serviceName)
+}
+
 type defaultCommandRunner struct{}
 
 func (d *defaultCommandRunner) LookPath(file string) (string, error) {
@@ -99,21 +105,47 @@ func (d *defaultCommandRunner) RunCommand(name string, env []string, arg ...stri
 	return cmd.Run()
 }
 
-var (
-	serviceManager ServiceManager = &defaultServiceManager{}
-	commandRunner  CommandRunner  = &defaultCommandRunner{}
-)
-
-// HighPerformanceHooks used to run additional hooks that will configure a system for the latency sensitive workloads.
-type HighPerformanceHooks struct {
-	irqBalanceConfigFile     string
-	cpusetLock               sync.Mutex
-	updateIRQSMPAffinityLock sync.Mutex
-	sharedCPUs               string
-	irqSMPAffinityFile       string
+// highPerformanceHooks used to run additional hooks that will configure a system for the latency sensitive workloads.
+type highPerformanceHooks struct {
+	irqBalanceConfigFile      string
+	cpusetLock                sync.Mutex
+	updateIRQSMPAffinityLock  sync.Mutex
+	sharedCPUs                string
+	irqSMPAffinityFile        string
+	irqBalanceRestartRequired chan struct{}
+	serviceManager            ServiceManager
+	commandRunner             CommandRunner
 }
 
-func (h *HighPerformanceHooks) PreCreate(ctx context.Context, specgen *generate.Generator, s *sandbox.Sandbox, c *oci.Container) error {
+func NewHighPerformanceHooks(ctx context.Context,
+	irqBalanceConfigFile, sharedCPUs, irqSMPAffinityFile string,
+	serviceManager ServiceManager, commandRunner CommandRunner,
+) *highPerformanceHooks {
+	if serviceManager == nil {
+		serviceManager = &defaultServiceManager{}
+	}
+
+	if commandRunner == nil {
+		commandRunner = &defaultCommandRunner{}
+	}
+
+	highPerformanceHooks := &highPerformanceHooks{
+		irqBalanceConfigFile:      irqBalanceConfigFile,
+		cpusetLock:                sync.Mutex{},
+		updateIRQSMPAffinityLock:  sync.Mutex{},
+		sharedCPUs:                sharedCPUs,
+		irqSMPAffinityFile:        irqSMPAffinityFile,
+		irqBalanceRestartRequired: make(chan struct{}),
+		serviceManager:            serviceManager,
+		commandRunner:             commandRunner,
+	}
+
+	go highPerformanceHooks.processIRQBalanceRestarts(ctx)
+
+	return highPerformanceHooks
+}
+
+func (h *highPerformanceHooks) PreCreate(ctx context.Context, specgen *generate.Generator, s *sandbox.Sandbox, c *oci.Container) error {
 	log.Infof(ctx, "Run %q runtime handler pre-create hook for the container %q", HighPerformance, c.ID())
 
 	if !shouldRunHooks(ctx, c.ID(), specgen.Config, s) {
@@ -149,7 +181,7 @@ func (h *HighPerformanceHooks) PreCreate(ctx context.Context, specgen *generate.
 	return nil
 }
 
-func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
+func (h *highPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
 	log.Infof(ctx, "Run %q runtime handler pre-start hook for the container %q", HighPerformance, c.ID())
 
 	cSpec := c.Spec()
@@ -229,7 +261,7 @@ func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s
 	return nil
 }
 
-func (h *HighPerformanceHooks) PreStop(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
+func (h *highPerformanceHooks) PreStop(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
 	ctx, span := log.StartSpan(ctx)
 	defer span.End()
 
@@ -283,7 +315,7 @@ func (h *HighPerformanceHooks) PreStop(ctx context.Context, c *oci.Container, s 
 }
 
 // If CPU load balancing is enabled, then *all* containers must run this PostStop hook.
-func (*HighPerformanceHooks) PostStop(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
+func (*highPerformanceHooks) PostStop(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
 	// We could check if `!cpuLoadBalancingAllowed()` here, but it requires access to the config, which would be
 	// odd to plumb. Instead, always assume if they're using a HighPerformanceHook, they have CPULoadBalanceDisabled
 	// annotation allowed.
@@ -348,7 +380,7 @@ func requestedSharedCPUs(annotations fields.Set, cName string) bool {
 // Since CRI-O is the owner of the container cgroup, it must set this value for
 // the container. Some other entity (kubelet, external service) must ensure this is the case for all
 // other cgroups that intersect (at minimum: all parent cgroups of this cgroup).
-func (h *HighPerformanceHooks) setCPULoadBalancing(ctx context.Context, c *oci.Container, podManager cgroups.Manager, containerManagers []cgroups.Manager, enable, sharedCPUsRequested bool) error {
+func (h *highPerformanceHooks) setCPULoadBalancing(ctx context.Context, c *oci.Container, podManager cgroups.Manager, containerManagers []cgroups.Manager, enable, sharedCPUsRequested bool) error {
 	if node.CgroupIsV2() {
 		return h.setCPULoadBalancingV2(ctx, c, podManager, containerManagers, enable, sharedCPUsRequested)
 	}
@@ -385,7 +417,7 @@ type desiredManagerCPUSetState struct {
 // Thus, this implementation assumes a certain amount of ownership CRI-O takes over this field. This ownership may not apply in the future.
 // Another note on cgroup ownership: currently, CRI-O overwrites cpuset.cpus, which is a field managed by systemd.
 // To avoid systemd clobbering this value, a libcontainer cgroup manager object is created, and through it CRI-O will use dbus to make changes to the cgroup.
-func (h *HighPerformanceHooks) setCPULoadBalancingV2(ctx context.Context, c *oci.Container, podManager cgroups.Manager, containerManagers []cgroups.Manager, enable, sharedCPUsRequested bool) (retErr error) {
+func (h *highPerformanceHooks) setCPULoadBalancingV2(ctx context.Context, c *oci.Container, podManager cgroups.Manager, containerManagers []cgroups.Manager, enable, sharedCPUsRequested bool) (retErr error) {
 	cpusString := c.Spec().Linux.Resources.CPU.Cpus
 
 	exclusiveCPUs, err := cpuset.Parse(cpusString)
@@ -497,7 +529,7 @@ func (h *HighPerformanceHooks) setCPULoadBalancingV2(ctx context.Context, c *oci
 	return cgroups.WriteFile(managers[len(managers)-1].manager.Path(""), "cpuset.cpus.partition", "isolated")
 }
 
-func (h *HighPerformanceHooks) addOrRemoveCpusetFromManagers(states []*desiredManagerCPUSetState, add bool) error {
+func (h *highPerformanceHooks) addOrRemoveCpusetFromManagers(states []*desiredManagerCPUSetState, add bool) error {
 	// Adding, we go top to bottom, when removing, bottom to top.
 	if !add {
 		slices.Reverse(states)
@@ -533,7 +565,7 @@ func (h *HighPerformanceHooks) addOrRemoveCpusetFromManagers(states []*desiredMa
 	return nil
 }
 
-func (h *HighPerformanceHooks) addOrRemoveCpusetFromManager(mgr cgroups.Manager, cpus cpuset.CPUSet, add bool, file string) error {
+func (h *highPerformanceHooks) addOrRemoveCpusetFromManager(mgr cgroups.Manager, cpus cpuset.CPUSet, add bool, file string) error {
 	h.cpusetLock.Lock()
 	defer h.cpusetLock.Unlock()
 
@@ -615,7 +647,7 @@ func disableCPULoadBalancingV1(containerManagers []cgroups.Manager) error {
 	return nil
 }
 
-func (h *HighPerformanceHooks) setIRQLoadBalancing(ctx context.Context, c *oci.Container, enable bool) error {
+func (h *highPerformanceHooks) setIRQLoadBalancing(ctx context.Context, c *oci.Container, enable bool) error {
 	lspec := c.Spec().Linux
 	if lspec == nil ||
 		lspec.Resources == nil ||
@@ -627,27 +659,56 @@ func (h *HighPerformanceHooks) setIRQLoadBalancing(ctx context.Context, c *oci.C
 	if err := h.updateNewIRQSMPAffinityMask(ctx, c.Name(), lspec.Resources.CPU.Cpus, enable); err != nil {
 		return err
 	}
-	// Outside of the lock section, we can restart the irqbalance service or run irqbalance --oneshot command.
-	// handleIRQBalanceRestart will log errors but will not return them, as it is not critical for the pod to start.
-	h.handleIRQBalanceRestart(ctx, c.Name())
+
+	// Register that we must restart irqbalance. Do not block if this was already sent to the channel.
+	select {
+	case h.irqBalanceRestartRequired <- struct{}{}:
+	default:
+	}
 
 	return nil
+}
+
+// processIRQBalanceRestarts restarts IRQBalance / irq oneshot service at most once every 100ms.
+func (h *highPerformanceHooks) processIRQBalanceRestarts(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-h.irqBalanceRestartRequired:
+			// Debounce for 100 milliseconds.
+			time.Sleep(100 * time.Millisecond)
+			// In the last 100 ms, we might have received another request for
+			// restart required. Remove from the channel and ignore.
+			select {
+			case <-h.irqBalanceRestartRequired:
+				// Drain additional signal that came in over the last 100 ms.
+			default:
+			}
+
+			h.handleIRQBalanceRestart(ctx)
+		}
+	}
 }
 
 // handleIRQBalanceRestart handles - outside of the lock section - the restart of the irqbalance service or runs
 // irqbalance --oneshot command if the service is not enabled. The environment variable for irqbalance oneshot
 // is read from h.irqBalanceConfigFile (/etc/sysconfig/irqbalance) which is guaranteed to be in a consistent state
 // after the lock section in updateNewIRQSMPAffinityMask.
-func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cName string) {
+func (h *highPerformanceHooks) handleIRQBalanceRestart(ctx context.Context) {
 	// Nothing else to do if irq balance config file does not exist.
 	if !fileExists(h.irqBalanceConfigFile) {
 		return
 	}
 
-	if serviceManager.IsServiceEnabled(irqBalancedName) {
-		log.Debugf(ctx, "Container %q restarting irqbalance service", cName)
+	if h.serviceManager.IsServiceEnabled(irqBalancedName) {
+		log.Debugf(ctx, "Restarting irqbalance service")
 
-		if err := serviceManager.RestartService(irqBalancedName); err != nil {
+		if err := h.serviceManager.ResetFailedService(irqBalancedName); err != nil {
+			log.Warnf(ctx, "Failed to reset irqbalance service failure state: %v", err)
+		}
+
+		if err := h.serviceManager.RestartService(irqBalancedName); err != nil {
 			log.Warnf(ctx, "Irqbalance service restart failed: %v", err)
 		}
 
@@ -655,7 +716,7 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 	}
 
 	// Handle irqbalance --oneshot below.
-	irqBalanceFullPath, err := commandRunner.LookPath(irqBalancedName)
+	irqBalanceFullPath, err := h.commandRunner.LookPath(irqBalancedName)
 	if err != nil {
 		// irqbalance is not installed, skip the rest; pod should still start, so return nil instead.
 		log.Warnf(ctx, "Irqbalance binary not found: %v", err)
@@ -682,15 +743,15 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 		text = strings.Trim(text, "\"'")
 		env := fmt.Sprintf("%s=%s", irqBalanceBannedCpus, text)
 
-		log.Debugf(ctx, "Container %q running '%s %s %s'", cName, env, irqBalanceFullPath, "--oneshot")
+		log.Debugf(ctx, "Running '%s %s %s'", env, irqBalanceFullPath, "--oneshot")
 
-		if err := commandRunner.RunCommand(
+		if err := h.commandRunner.RunCommand(
 			irqBalanceFullPath,
 			[]string{env},
 			"--oneshot",
 		); err != nil {
-			log.Warnf(ctx, "Container %q failed to run '%s %s %s', err: %q",
-				cName, env, irqBalanceFullPath, "--oneshot", err)
+			log.Warnf(ctx, "failed to run '%s %s %s', err: %q",
+				env, irqBalanceFullPath, "--oneshot", err)
 		}
 
 		return
@@ -709,7 +770,7 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 // write those masks to /proc/irq/default_smp_affinity and /etc/sysconfig/irqbalance
 // Without this lock, 2 threads could read from the file and calculate the new mask but overwrite the
 // results of each other.
-func (h *HighPerformanceHooks) updateNewIRQSMPAffinityMask(ctx context.Context, cName, cpus string, enable bool) error {
+func (h *highPerformanceHooks) updateNewIRQSMPAffinityMask(ctx context.Context, cName, cpus string, enable bool) error {
 	h.updateIRQSMPAffinityLock.Lock()
 	defer h.updateIRQSMPAffinityLock.Unlock()
 
@@ -1153,8 +1214,8 @@ func RestoreIrqBalanceConfig(ctx context.Context, irqBalanceConfigFile, irqBanne
 		return err
 	}
 
-	if serviceManager.IsServiceEnabled(irqBalancedName) {
-		if err := serviceManager.RestartService(irqBalancedName); err != nil {
+	if isServiceEnabled(irqBalancedName) {
+		if err := restartService(irqBalancedName); err != nil {
 			log.Warnf(ctx, "Irqbalance service restart failed: %v", err)
 		}
 	}

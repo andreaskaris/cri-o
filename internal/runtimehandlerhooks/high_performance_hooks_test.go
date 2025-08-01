@@ -40,9 +40,10 @@ const (
 )
 
 type mockServiceManager struct {
-	isServiceEnabled map[string]bool
-	restartService   map[string]error
-	history          []string
+	isServiceEnabled   map[string]bool
+	restartService     map[string]error
+	resetFailedService map[string]error
+	history            []string
 }
 
 func (m *mockServiceManager) IsServiceEnabled(serviceName string) bool {
@@ -61,6 +62,15 @@ func (m *mockServiceManager) RestartService(serviceName string) error {
 	}
 
 	return m.restartService[serviceName]
+}
+
+func (m *mockServiceManager) ResetFailedService(serviceName string) error {
+	m.history = append(m.history, "systemctl reset-failed "+serviceName)
+	if m.resetFailedService == nil {
+		return errors.New("service not found")
+	}
+
+	return m.resetFailedService[serviceName]
 }
 
 type mockCommandRunner struct {
@@ -120,10 +130,14 @@ var _ = Describe("high_performance_hooks", func() {
 		irqSmpAffinityFile := filepath.Join(fixturesDir, "irq_smp_affinity")
 		irqBalanceConfigFile := filepath.Join(fixturesDir, "irqbalance")
 		verifySetIRQLoadBalancing := func(enabled bool, expected string) {
-			h := &HighPerformanceHooks{
-				irqBalanceConfigFile: irqBalanceConfigFile,
-				irqSMPAffinityFile:   irqSmpAffinityFile,
-			}
+			h := NewHighPerformanceHooks(
+				context.TODO(),
+				irqBalanceConfigFile,
+				"",
+				irqSmpAffinityFile,
+				&mockServiceManager{},
+				&mockCommandRunner{},
+			)
 			err := h.setIRQLoadBalancing(context.TODO(), container, enabled)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -177,10 +191,14 @@ var _ = Describe("high_performance_hooks", func() {
 		irqSmpAffinityFile := filepath.Join(fixturesDir, "irq_smp_affinity")
 		irqBalanceConfigFile := filepath.Join(fixturesDir, "irqbalance")
 		verifySetIRQLoadBalancing := func(enabled bool, expectedSmp, expectedBan string) {
-			h := &HighPerformanceHooks{
-				irqBalanceConfigFile: irqBalanceConfigFile,
-				irqSMPAffinityFile:   irqSmpAffinityFile,
-			}
+			h := NewHighPerformanceHooks(
+				context.TODO(),
+				irqBalanceConfigFile,
+				"",
+				irqSmpAffinityFile,
+				&mockServiceManager{},
+				&mockCommandRunner{},
+			)
 			err = h.setIRQLoadBalancing(context.TODO(), container, enabled)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -609,8 +627,6 @@ var _ = Describe("high_performance_hooks", func() {
 	})
 
 	Describe("restoreIrqBalanceConfig", func() {
-		var mockSvcMgr *mockServiceManager
-
 		irqSmpAffinityFile := filepath.Join(fixturesDir, "irq_smp_affinity")
 		irqBalanceConfigFile := filepath.Join(fixturesDir, "irqbalance")
 		irqBannedCPUConfigFile := filepath.Join(fixturesDir, "orig_irq_banned_cpus")
@@ -640,21 +656,6 @@ var _ = Describe("high_performance_hooks", func() {
 			bannedCPUs, err := retrieveIrqBannedCPUMasks(irqBalanceConfigFile)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(bannedCPUs).To(Equal("0000ffff,ffffcfcc"))
-
-			mockSvcMgr = &mockServiceManager{
-				isServiceEnabled: map[string]bool{
-					"irqbalance": true,
-				},
-				restartService: map[string]error{
-					"irqbalance": nil,
-				},
-				history: []string{},
-			}
-			serviceManager = mockSvcMgr
-		})
-
-		JustAfterEach(func() {
-			serviceManager = &defaultServiceManager{}
 		})
 
 		Context("when banned cpu config file doesn't exist", func() {
@@ -665,8 +666,6 @@ var _ = Describe("high_performance_hooks", func() {
 
 			It("should set banned cpu config file from irq balance config", func() {
 				verifyRestoreIrqBalanceConfig("0000ffff,ffffcfcc", "0000ffff,ffffcfcc")
-				Expect(mockSvcMgr.history).NotTo(ContainElement("systemctl is-enabled irqbalance"))
-				Expect(mockSvcMgr.history).NotTo(ContainElement("systemctl restart irqbalance"))
 			})
 		})
 
@@ -680,8 +679,6 @@ var _ = Describe("high_performance_hooks", func() {
 
 			It("should restore irq balance config with content from banned cpu config file", func() {
 				verifyRestoreIrqBalanceConfig("00000000,00000000", "00000000,00000000")
-				Expect(mockSvcMgr.history).To(ContainElement("systemctl is-enabled irqbalance"))
-				Expect(mockSvcMgr.history).To(ContainElement("systemctl restart irqbalance"))
 			})
 		})
 	})
@@ -689,22 +686,15 @@ var _ = Describe("high_performance_hooks", func() {
 	Describe("handleIRQBalanceRestart", func() {
 		irqBalanceConfigFile := filepath.Join(fixturesDir, "irqbalance")
 
-		h := &HighPerformanceHooks{
-			irqBalanceConfigFile: irqBalanceConfigFile,
-		}
-
 		DescribeTable("handleIRQBalanceRestart scenarios",
 			func(description string, isServiceEnabled bool, restartServiceSucceeds bool, pathLookupError bool, irqBalanceContent string) {
-				defer func() {
-					// Reset global mocks
-					serviceManager = &defaultServiceManager{}
-					commandRunner = &defaultCommandRunner{}
-				}()
-
 				// Setup mocks
 				mockSvcMgr := &mockServiceManager{
 					isServiceEnabled: map[string]bool{
 						"irqbalance": isServiceEnabled,
+					},
+					resetFailedService: map[string]error{
+						"irqbalance": nil,
 					},
 					history: []string{},
 				}
@@ -724,6 +714,15 @@ var _ = Describe("high_performance_hooks", func() {
 				mockCmdRunner := &mockCommandRunner{
 					history: []string{},
 				}
+
+				h := NewHighPerformanceHooks(
+					context.TODO(),
+					irqBalanceConfigFile,
+					"",
+					"",
+					mockSvcMgr,
+					mockCmdRunner,
+				)
 
 				if !isServiceEnabled {
 					if pathLookupError {
@@ -753,16 +752,13 @@ var _ = Describe("high_performance_hooks", func() {
 					Expect(err).ToNot(HaveOccurred())
 				}
 
-				// Set global mocks
-				serviceManager = mockSvcMgr
-				commandRunner = mockCmdRunner
-
 				// Execute
-				h.handleIRQBalanceRestart(context.TODO(), "container-name")
+				h.handleIRQBalanceRestart(context.TODO())
 
 				// Verify behavior based on scenario
 				if isServiceEnabled {
 					Expect(mockSvcMgr.history).To(ContainElement("systemctl is-enabled irqbalance"))
+					Expect(mockSvcMgr.history).To(ContainElement("systemctl reset-failed irqbalance"))
 					Expect(mockSvcMgr.history).To(ContainElement("systemctl restart irqbalance"))
 					Expect(mockCmdRunner.history).To(BeEmpty())
 
@@ -787,6 +783,77 @@ var _ = Describe("high_performance_hooks", func() {
 			Entry("irqbalance is disabled, empty banned cpus", "irqbalance is disabled, command fails", false, false, false, ""),
 			Entry("irqbalance is disabled, with banned cpus", "irqbalance is disabled, command succeeds", false, false, false, "ffff,ffff"),
 			Entry("irqbalance is disabled, missing banned cpus", "irqbalance is disabled, command succeeds", false, false, false, "none"),
+		)
+	})
+
+	Describe("processIRQBalanceRestarts", func() {
+		irqBalanceConfigFile := filepath.Join(fixturesDir, "irqbalance")
+
+		DescribeTable("processIRQBalanceRestarts debouncing scenarios",
+			func(description string, restartRequests []time.Duration, expectedRestartCount int) {
+				// Setup mocks - service is always enabled
+				mockSvcMgr := &mockServiceManager{
+					isServiceEnabled: map[string]bool{
+						"irqbalance": true,
+					},
+					restartService: map[string]error{
+						"irqbalance": nil,
+					},
+					resetFailedService: map[string]error{
+						"irqbalance": nil,
+					},
+					history: []string{},
+				}
+
+				// Setup config file
+				err := os.WriteFile(irqBalanceConfigFile, []byte("IRQBALANCE_BANNED_CPUS=\"ffff,ffff\""), 0o644)
+				Expect(err).ToNot(HaveOccurred())
+
+				// Create hooks instance with a context that we can cancel
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				h := NewHighPerformanceHooks(ctx, irqBalanceConfigFile, "", "", mockSvcMgr, &mockCommandRunner{})
+
+				// Give some time for the processor to start
+				time.Sleep(100 * time.Millisecond)
+
+				// Send restart requests at specified intervals
+				for _, delay := range restartRequests {
+					if delay > 0 {
+						time.Sleep(delay)
+					}
+					// Use the same non-blocking approach as the actual code
+					select {
+					case h.irqBalanceRestartRequired <- struct{}{}:
+					default:
+					}
+				}
+
+				// Wait a bit longer than the debounce period to ensure processing completes
+				time.Sleep(150 * time.Millisecond)
+
+				// Cancel context to stop the processor
+				cancel()
+
+				// Verify the expected number of restarts occurred
+				restartCount := 0
+				resetFailedCount := 0
+				for _, cmd := range mockSvcMgr.history {
+					if cmd == "systemctl restart irqbalance" {
+						restartCount++
+					}
+					if cmd == "systemctl reset-failed irqbalance" {
+						resetFailedCount++
+					}
+				}
+				Expect(restartCount).To(Equal(expectedRestartCount), "Expected %d restarts, got %d", expectedRestartCount, restartCount)
+				Expect(resetFailedCount).To(Equal(expectedRestartCount), "Expected %d reset-failed calls, got %d", expectedRestartCount, resetFailedCount)
+			},
+			Entry("Single restart request", "Single restart request", []time.Duration{0}, 1),
+			Entry("Multiple rapid requests (debounced)", "Multiple rapid requests", []time.Duration{0, 10 * time.Millisecond, 20 * time.Millisecond, 30 * time.Millisecond}, 1),
+			Entry("Requests spaced beyond debounce period", "Spaced requests", []time.Duration{0, 150 * time.Millisecond, 150 * time.Millisecond}, 3),
+			Entry("Mixed timing (some debounced, some not)", "Mixed timing", []time.Duration{0, 10 * time.Millisecond, 150 * time.Millisecond, 20 * time.Millisecond}, 2),
 		)
 	})
 
@@ -944,7 +1011,14 @@ var _ = Describe("high_performance_hooks", func() {
 		Expect(err).ToNot(HaveOccurred())
 
 		It("should inject env variable only to pod with cpu-shared.crio.io annotation", func() {
-			h := HighPerformanceHooks{sharedCPUs: "3,4"}
+			h := NewHighPerformanceHooks(
+				context.TODO(),
+				"",
+				"3,4",
+				"",
+				&mockServiceManager{},
+				&mockCommandRunner{},
+			)
 			err := h.PreCreate(context.TODO(), g, sb, c)
 			Expect(err).ToNot(HaveOccurred())
 			env := g.Config.Process.Env
@@ -1069,9 +1143,9 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should set the correct irq bit mask with concurrency", func() {
-				hooks := hooksRetriever.Get(sb.RuntimeHandler(), sb.Annotations())
+				hooks := hooksRetriever.Get(context.TODO(), sb.RuntimeHandler(), sb.Annotations())
 				Expect(hooks).NotTo(BeNil())
-				if hph, ok := hooks.(*HighPerformanceHooks); ok {
+				if hph, ok := hooks.(*highPerformanceHooks); ok {
 					hph.irqSMPAffinityFile = irqSmpAffinityFile
 					hph.irqBalanceConfigFile = irqBalanceConfigFile
 				}
@@ -1109,9 +1183,9 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should keep the current irq bit mask but return a high performance hooks", func() {
-				hooks := hooksRetriever.Get(sb.RuntimeHandler(), sb.Annotations())
+				hooks := hooksRetriever.Get(context.TODO(), sb.RuntimeHandler(), sb.Annotations())
 				Expect(hooks).NotTo(BeNil())
-				hph, ok := hooks.(*HighPerformanceHooks)
+				hph, ok := hooks.(*highPerformanceHooks)
 				Expect(ok).To(BeTrue())
 				hph.irqSMPAffinityFile = irqSmpAffinityFile
 				hph.irqBalanceConfigFile = irqBalanceConfigFile
@@ -1152,9 +1226,9 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should set the correct irq bit mask with concurrency", func() {
-				hooks := hooksRetriever.Get(sb.RuntimeHandler(), sb.Annotations())
+				hooks := hooksRetriever.Get(context.TODO(), sb.RuntimeHandler(), sb.Annotations())
 				Expect(hooks).NotTo(BeNil())
-				if hph, ok := hooks.(*HighPerformanceHooks); ok {
+				if hph, ok := hooks.(*highPerformanceHooks); ok {
 					hph.irqSMPAffinityFile = irqSmpAffinityFile
 					hph.irqBalanceConfigFile = irqBalanceConfigFile
 				}
@@ -1194,7 +1268,7 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should return a nil hook", func() {
-				hooks := hooksRetriever.Get(sb.RuntimeHandler(), sb.Annotations())
+				hooks := hooksRetriever.Get(context.TODO(), sb.RuntimeHandler(), sb.Annotations())
 				Expect(hooks).To(BeNil())
 			})
 		})
@@ -1217,9 +1291,9 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should set the correct irq bit mask with concurrency", func() {
-				hooks := hooksRetriever.Get(sb.RuntimeHandler(), sb.Annotations())
+				hooks := hooksRetriever.Get(context.TODO(), sb.RuntimeHandler(), sb.Annotations())
 				Expect(hooks).NotTo(BeNil())
-				if hph, ok := hooks.(*HighPerformanceHooks); ok {
+				if hph, ok := hooks.(*highPerformanceHooks); ok {
 					hph.irqSMPAffinityFile = irqSmpAffinityFile
 					hph.irqBalanceConfigFile = irqBalanceConfigFile
 				}
@@ -1267,7 +1341,7 @@ var _ = Describe("high_performance_hooks", func() {
 			})
 
 			It("should yield a DefaultCPULoadBalanceHooks which keeps the old mask", func() {
-				hooks := hooksRetriever.Get(sb.RuntimeHandler(), sb.Annotations())
+				hooks := hooksRetriever.Get(context.TODO(), sb.RuntimeHandler(), sb.Annotations())
 				Expect(hooks).NotTo(BeNil())
 				_, ok := (hooks).(*DefaultCPULoadBalanceHooks)
 				Expect(ok).To(BeTrue())

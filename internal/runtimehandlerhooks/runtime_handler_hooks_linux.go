@@ -40,8 +40,8 @@ func NewHooksRetriever(ctx context.Context, config *libconfig.Config) *HooksRetr
 // the single instance of highPerformanceHooks.
 // Otherwise, if crio's config allows CPU load balancing anywhere, return a DefaultCPULoadBalanceHooks.
 // Otherwise, return nil.
-func (hr *HooksRetriever) Get(runtimeName string, sandboxAnnotations map[string]string) RuntimeHandlerHooks {
-	if strings.Contains(runtimeName, HighPerformance) || highPerformanceAnnotationsSpecified(sandboxAnnotations) {
+func (hr *HooksRetriever) Get(ctx context.Context, runtimeName string, sandboxAnnotations map[string]string) RuntimeHandlerHooks {
+	if isHighPerformanceRuntime(runtimeName, sandboxAnnotations) {
 		if hr.highPerformanceHooks == nil {
 			hr.highPerformanceHooks = &HighPerformanceHooks{
 				irqBalanceConfigFile:     hr.config.IrqBalanceConfigFile,

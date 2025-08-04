@@ -47,7 +47,7 @@ func (s *Server) stopContainer(ctx context.Context, ctr *oci.Container, timeout 
 
 	hooks := s.hooksRetriever.Get(sb.RuntimeHandler(), sb.Annotations())
 	if hooks != nil {
-		if err := hooks.PreStop(ctx, ctr, sb); err != nil {
+		if err := hooks.PreStop(ctx, s.ContainerServer, ctr, sb); err != nil {
 			return fmt.Errorf("failed to run pre-stop hook for container %q: %w", ctr.ID(), err)
 		}
 	}

@@ -24,6 +24,7 @@ import (
 
 	"github.com/cri-o/cri-o/internal/config/cgmgr"
 	"github.com/cri-o/cri-o/internal/config/node"
+	"github.com/cri-o/cri-o/internal/lib"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
@@ -48,6 +49,7 @@ const (
 	irqBalanceBannedCpus = "IRQBALANCE_BANNED_CPUS"
 	irqBalancedName      = "irqbalance"
 	sysCPUDir            = "/sys/devices/system/cpu"
+	sysCPUPresentFile    = "/sys/devices/system/cpu/present"
 	sysCPUSaveDir        = "/var/run/crio/cpu"
 	milliCPUToCPU        = 1000
 )
@@ -113,6 +115,7 @@ type HighPerformanceHooks struct {
 	sharedCPUs               string
 	execCPUAffinity          config.ExecCPUAffinityType
 	irqSMPAffinityFile       string
+	cpuPresentFile           string
 }
 
 func (h *HighPerformanceHooks) PreCreate(ctx context.Context, specgen *generate.Generator, s *sandbox.Sandbox, c *oci.Container) error {
@@ -199,7 +202,7 @@ func (h *HighPerformanceHooks) setExecCPUAffinity(ctx context.Context, specgen *
 	return nil
 }
 
-func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
+func (h *HighPerformanceHooks) PreStart(ctx context.Context, containerServer *lib.ContainerServer, c *oci.Container, s *sandbox.Sandbox) error {
 	log.Infof(ctx, "Run %q runtime handler pre-start hook for the container %q", HighPerformance, c.ID())
 
 	cSpec := c.Spec()
@@ -237,7 +240,7 @@ func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s
 	if shouldIRQLoadBalancingBeDisabled(ctx, s.Annotations()) {
 		log.Infof(ctx, "Disable irq smp balancing for container %q", c.ID())
 
-		if err := h.setIRQLoadBalancing(ctx, c, false); err != nil {
+		if err := h.setIRQLoadBalancing(ctx, containerServer, nil); err != nil {
 			return fmt.Errorf("set IRQ load balancing: %w", err)
 		}
 	}
@@ -279,7 +282,7 @@ func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s
 	return nil
 }
 
-func (h *HighPerformanceHooks) PreStop(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
+func (h *HighPerformanceHooks) PreStop(ctx context.Context, containerServer *lib.ContainerServer, c *oci.Container, s *sandbox.Sandbox) error {
 	ctx, span := log.StartSpan(ctx)
 	defer span.End()
 
@@ -292,7 +295,7 @@ func (h *HighPerformanceHooks) PreStop(ctx context.Context, c *oci.Container, s 
 
 	// enable the IRQ smp balancing for the container CPUs
 	if shouldIRQLoadBalancingBeDisabled(ctx, s.Annotations()) {
-		if err := h.setIRQLoadBalancing(ctx, c, true); err != nil {
+		if err := h.setIRQLoadBalancing(ctx, containerServer, c); err != nil {
 			return fmt.Errorf("set IRQ load balancing: %w", err)
 		}
 	}
@@ -665,21 +668,34 @@ func disableCPULoadBalancingV1(containerManagers []cgroups.Manager) error {
 	return nil
 }
 
-func (h *HighPerformanceHooks) setIRQLoadBalancing(ctx context.Context, c *oci.Container, enable bool) error {
-	lspec := c.Spec().Linux
-	if lspec == nil ||
-		lspec.Resources == nil ||
-		lspec.Resources.CPU == nil ||
-		lspec.Resources.CPU.Cpus == "" {
-		return fmt.Errorf("find container %s CPUs", c.ID())
+// setIRQLoadBalancing manages IRQ SMP affinity configuration using a level-driven approach.
+// When deleteContainer is nil, this represents a container start operation and the function calculates
+// the IRQ affinity state based on all running containers. When deleteContainer is provided, this represents
+// a container stop operation, and the function finds all pod siblings to ensure the entire pod's IRQ
+// affinity is properly restored.
+//
+// The function coordinates the complete IRQ affinity update process and triggers irqbalance service
+// restart or oneshot execution outside the critical section to apply the changes.
+func (h *HighPerformanceHooks) setIRQLoadBalancing(ctx context.Context, containerServer *lib.ContainerServer, deleteContainer *oci.Container) error {
+	// During a delete request, the containers and all its siblings still show up
+	// in crio's list. Find all other containers that are running inside the same pod so that we can remove all of them.
+	deleteContainers := []*oci.Container{}
+	if deleteContainer != nil {
+		var err error
+		deleteContainers, err = findPodSiblings(containerServer, deleteContainer)
+		if err != nil {
+			return fmt.Errorf("failed to find pod siblings for container %q: %w", deleteContainer.ID(), err)
+		}
 	}
 
-	if err := h.updateNewIRQSMPAffinityMask(ctx, c.Name(), lspec.Resources.CPU.Cpus, enable); err != nil {
-		return err
+	// updateNewIRQSMPAffinityMask runs inside a mutex lock where it retrieves the current state, calculates the
+	// required mask, and writes the changes to the required files.
+	if err := h.updateNewIRQSMPAffinityMask(ctx, containerServer, deleteContainers); err != nil {
+		return fmt.Errorf("failed to update IRQ SMP affinity mask: %w", err)
 	}
 	// Outside of the lock section, we can restart the irqbalance service or run irqbalance --oneshot command.
 	// handleIRQBalanceRestart will log errors but will not return them, as it is not critical for the pod to start.
-	h.handleIRQBalanceRestart(ctx, c.Name())
+	h.handleIRQBalanceRestart(ctx)
 
 	return nil
 }
@@ -688,7 +704,7 @@ func (h *HighPerformanceHooks) setIRQLoadBalancing(ctx context.Context, c *oci.C
 // irqbalance --oneshot command if the service is not enabled. The environment variable for irqbalance oneshot
 // is read from h.irqBalanceConfigFile (/etc/sysconfig/irqbalance) which is guaranteed to be in a consistent state
 // after the lock section in updateNewIRQSMPAffinityMask.
-func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cName string) {
+func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context) {
 	// Nothing else to do if irq balance config file does not exist.
 	if !fileExists(h.irqBalanceConfigFile) {
 		return
@@ -700,7 +716,7 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 	// See:
 	// https://github.com/cri-o/cri-o/pull/8834/commits/b96928dcbb7956e0ebde42238e88955831411216
 	if serviceManager.IsServiceEnabled(irqBalancedName) {
-		log.Debugf(ctx, "Container %q restarting irqbalance service", cName)
+		log.Debugf(ctx, "Restarting irqbalance service")
 
 		if err := serviceManager.RestartService(irqBalancedName); err != nil {
 			log.Warnf(ctx, "Irqbalance service restart failed: %v", err)
@@ -737,15 +753,15 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 		text = strings.Trim(text, "\"'")
 		env := fmt.Sprintf("%s=%s", irqBalanceBannedCpus, text)
 
-		log.Debugf(ctx, "Container %q running '%s %s %s'", cName, env, irqBalanceFullPath, "--oneshot")
+		log.Debugf(ctx, "Running '%s %s %s'", env, irqBalanceFullPath, "--oneshot")
 
 		if err := commandRunner.RunCommand(
 			irqBalanceFullPath,
 			[]string{env},
 			"--oneshot",
 		); err != nil {
-			log.Warnf(ctx, "Container %q failed to run '%s %s %s', err: %q",
-				cName, env, irqBalanceFullPath, "--oneshot", err)
+			log.Warnf(ctx, "Failed to run '%s %s %s', err: %q",
+				env, irqBalanceFullPath, "--oneshot", err)
 		}
 
 		return
@@ -758,48 +774,43 @@ func (h *HighPerformanceHooks) handleIRQBalanceRestart(ctx context.Context, cNam
 	log.Warnf(ctx, "Failed to find %q in irq balance config file %q", irqBalanceBannedCpus, h.irqBalanceConfigFile)
 }
 
-// updateNewIRQSMPAffinityMask updates SMP IRQ affinity and IRQ balance configuration files.
-// The entire function must be wrapped inside a single lock to avoid race conditions.
-// The reason for this is that once we read from the SMP IRQ affinity file, we have to calculate new masks and
-// write those masks to /proc/irq/default_smp_affinity and /etc/sysconfig/irqbalance
-// Without this lock, 2 threads could read from the file and calculate the new mask but overwrite the
-// results of each other.
-func (h *HighPerformanceHooks) updateNewIRQSMPAffinityMask(ctx context.Context, cName, cpus string, enable bool) error {
+// updateNewIRQSMPAffinityMask updates SMP IRQ affinity and IRQ balance configuration files using a level-driven approach.
+// This function calculates the correct IRQ affinity state based on all currently running containers rather than
+// performing incremental updates. It considers which containers are being deleted and recalculates the complete
+// affinity mask accordingly.
+//
+// The entire function is wrapped in a mutex lock to prevent race conditions between concurrent container
+// start/stop operations that could lead to inconsistent IRQ affinity states. The lock ensures atomicity
+// of the read-calculate-write sequence across both /proc/irq/default_smp_affinity and /etc/sysconfig/irqbalance files.
+func (h *HighPerformanceHooks) updateNewIRQSMPAffinityMask(ctx context.Context, containerServer *lib.ContainerServer,
+	deleteContainers []*oci.Container) error {
 	h.updateIRQSMPAffinityLock.Lock()
 	defer h.updateIRQSMPAffinityLock.Unlock()
 
-	content, err := os.ReadFile(h.irqSMPAffinityFile)
+	// First, calculate which CPUs should not be modified, where we should enable IRQ SMP load balancing,
+	// and where we should disable it.
+	unmanagedCPUSet, enabledCPUSet, disabledCPUSet, err := h.calcIRQSMPAffinityCPUs(ctx, containerServer, deleteContainers)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to calculate IRQ SMP affinity CPUs: %w", err)
 	}
+	log.Debugf(ctx, "DEBUG_FLAG IRQ affinity CPU sets - unmanaged: %q, enabled: %q, disabled: %q", unmanagedCPUSet, enabledCPUSet, disabledCPUSet)
 
-	originalIRQSMPSetting := strings.TrimSpace(string(content))
-
-	newIRQSMPSetting, newIRQBalanceSetting, err := calcIRQSMPAffinityMask(cpus, originalIRQSMPSetting, enable)
+	// Next, calculate the new masks for IRQ SMP affinity file and for irqbalance configuration.
+	originalIRQSMPSettingRaw, err := os.ReadFile(h.irqSMPAffinityFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read IRQ SMP affinity file %q: %w", h.irqSMPAffinityFile, err)
 	}
-
-	log.Debugf(ctx, "Container %q set %q: %q; %q: %q", cName,
-		h.irqSMPAffinityFile, newIRQSMPSetting,
-		h.irqBalanceConfigFile, newIRQBalanceSetting,
-	)
-
-	if err := os.WriteFile(h.irqSMPAffinityFile, []byte(newIRQSMPSetting), 0o644); err != nil {
-		return err
+	originalIRQSMPSetting := strings.TrimSpace(string(originalIRQSMPSettingRaw))
+	log.Debugf(ctx, "DEBUG_FLAG original IRQ SMP setting: %q", originalIRQSMPSetting)
+	newIRQSMPSetting, newIRQBalanceSetting, err := calcIRQSMPAffinityMask(originalIRQSMPSetting, unmanagedCPUSet,
+		enabledCPUSet, disabledCPUSet)
+	if err != nil {
+		return fmt.Errorf("failed to calculate IRQ SMP affinity mask: %w", err)
 	}
+	log.Debugf(ctx, "New IRQ masks are - %q: %q; %q: %q", h.irqSMPAffinityFile, newIRQSMPSetting, h.irqBalanceConfigFile, newIRQBalanceSetting)
 
-	// Nothing else to do if irq balance config file does not exist.
-	if !fileExists(h.irqBalanceConfigFile) {
-		return nil
-	}
-
-	if err := updateIrqBalanceConfigFile(h.irqBalanceConfigFile, newIRQBalanceSetting); err != nil {
-		// Rollback IRQ SMP affinity file to maintain consistency
-		if rollbackErr := os.WriteFile(h.irqSMPAffinityFile, []byte(originalIRQSMPSetting), 0o644); rollbackErr != nil {
-			log.Errorf(ctx, "Failed to rollback IRQ SMP affinity file after config update failure: %v", rollbackErr)
-		}
-
+	// Last, write the changes to IRQ SMP affinity file and to IRQ Balance config file.
+	if err := h.writeIRQAffinityFiles(ctx, newIRQSMPSetting, newIRQBalanceSetting, originalIRQSMPSetting); err != nil {
 		return err
 	}
 
@@ -952,13 +963,11 @@ func setCPUPMQOSResumeLatency(c *oci.Container, latency string) error {
 
 // doSetCPUPMQOSResumeLatency facilitates unit testing by allowing the directories to be specified as parameters.
 func doSetCPUPMQOSResumeLatency(c *oci.Container, latency, cpuDir, cpuSaveDir string) error {
-	lspec := c.Spec().Linux
-	if lspec == nil ||
-		lspec.Resources == nil ||
-		lspec.Resources.CPU == nil ||
-		lspec.Resources.CPU.Cpus == "" {
+	cSpec := c.Spec()
+	if isContainerCPUsSpecEmpty(&cSpec) {
 		return fmt.Errorf("find container %s CPUs", c.ID())
 	}
+	lspec := cSpec.Linux
 
 	cpus, err := cpuset.Parse(lspec.Resources.CPU.Cpus)
 	if err != nil {
@@ -1057,13 +1066,11 @@ func setCPUFreqGovernor(c *oci.Container, governor string) error {
 
 // doSetCPUFreqGovernor facilitates unit testing by allowing the directories to be specified as parameters.
 func doSetCPUFreqGovernor(c *oci.Container, governor, cpuDir, cpuSaveDir string) error {
-	lspec := c.Spec().Linux
-	if lspec == nil ||
-		lspec.Resources == nil ||
-		lspec.Resources.CPU == nil ||
-		lspec.Resources.CPU.Cpus == "" {
+	cSpec := c.Spec()
+	if isContainerCPUsSpecEmpty(&cSpec) {
 		return fmt.Errorf("find container %s CPUs", c.ID())
 	}
+	lspec := cSpec.Linux
 
 	cpus, err := cpuset.Parse(lspec.Resources.CPU.Cpus)
 	if err != nil {
@@ -1481,9 +1488,202 @@ func getPodQuotaV2(mng cgroups.Manager) (string, error) {
 	return cpuQuota, nil
 }
 
+// findPodSiblings returns all containers in the same pod as the given container.
+// This includes the container itself.
+func findPodSiblings(containerServer *lib.ContainerServer, container *oci.Container) ([]*oci.Container, error) {
+	if container == nil {
+		return nil, fmt.Errorf("failed to find pod siblings: container is nil")
+	}
+
+	// Get the sandbox ID from the container
+	sandboxID := container.Sandbox()
+	if sandboxID == "" {
+		return []*oci.Container{container}, nil
+	}
+
+	// Get the sandbox from the container server
+	sandbox := containerServer.GetSandbox(sandboxID)
+	if sandbox == nil {
+		return []*oci.Container{container}, nil
+	}
+
+	// Get all containers in the sandbox
+	siblings := sandbox.Containers().List()
+
+	return siblings, nil
+}
+
 func injectCpusetEnv(specgen *generate.Generator, isolated, shared *cpuset.CPUSet) {
 	spec := specgen.Config
 	spec.Process.Env = append(spec.Process.Env,
 		fmt.Sprintf("%s=%s", IsolatedCPUsEnvVar, isolated.String()),
 		fmt.Sprintf("%s=%s", SharedCPUsEnvVar, shared.String()))
+}
+
+// isHighPerformanceRuntime checks if the runtime name or annotations indicate high-performance usage.
+func isHighPerformanceRuntime(runtimeName string, annotations map[string]string) bool {
+	return strings.Contains(runtimeName, HighPerformance) ||
+		highPerformanceAnnotationsSpecified(annotations)
+}
+
+// parseInfraCPUSet extracts and parses the infrastructure container CPU set from the container server configuration.
+// Returns an empty CPU set if no InfraCtrCPUSet is configured.
+func parseInfraCPUSet(containerServer *lib.ContainerServer) (cpuset.CPUSet, error) {
+	infraCtrCPUs := containerServer.Config().RuntimeConfig.InfraCtrCPUSet
+	if infraCtrCPUs == "" {
+		return cpuset.CPUSet{}, nil
+	}
+
+	unmanagedCPUSet, err := cpuset.Parse(string(infraCtrCPUs))
+	if err != nil {
+		return cpuset.CPUSet{}, fmt.Errorf("failed to parse InfraCtrCPUSet %q: %w", infraCtrCPUs, err)
+	}
+
+	return unmanagedCPUSet, nil
+}
+
+// readPresentCPUSet reads and parses the system's present CPU set from the kernel.
+func (h *HighPerformanceHooks) readPresentCPUSet() (cpuset.CPUSet, error) {
+	presentCPUs, err := os.ReadFile(h.cpuPresentFile)
+	if err != nil {
+		return cpuset.CPUSet{}, fmt.Errorf("failed to read present CPUs from %q: %w", h.cpuPresentFile, err)
+	}
+
+	presentCPUStr := strings.TrimSpace(string(presentCPUs))
+	presentCPUSet, err := cpuset.Parse(presentCPUStr)
+	if err != nil {
+		return cpuset.CPUSet{}, fmt.Errorf("failed to parse present CPUs %q: %w", presentCPUStr, err)
+	}
+
+	return presentCPUSet, nil
+}
+
+// calculateContainerCPUSets iterates over all containers and calculates which CPUs should be enabled/disabled
+// for IRQ SMP affinity based on container requirements and delete list.
+func calculateContainerCPUSets(ctx context.Context, containerServer *lib.ContainerServer, deleteContainers []*oci.Container,
+	presentCPUSet, unmanagedCPUSet cpuset.CPUSet) (enabled, disabled cpuset.CPUSet, err error) {
+	// Initialize the sets of enabled and disabled CPUs.
+	enabledCPUSet := presentCPUSet.Difference(unmanagedCPUSet)
+	disabledCPUSet := cpuset.CPUSet{}
+
+	// Iterate over all present containers. If IRQ SMP affinity shall be disabled for a container, remove its CPUs
+	// from the enabledCPUSet and add them to the disabledCPUSet.
+	containers, err := containerServer.ListContainers()
+	if err != nil {
+		return cpuset.CPUSet{}, cpuset.CPUSet{}, fmt.Errorf("failed to list containers: %w", err)
+	}
+	log.Debugf(ctx, "DEBUG_FLAG all containers %v", containers)
+
+outer:
+	for _, c := range containers {
+		// Check if the container is in the list of deleteContainers (if it is, we skip) or if we want to keep IRQ SMP
+		// balance for this container.
+		containerName := c.Name()
+		cSpec := c.Spec()
+		sb := containerServer.GetSandbox(c.Sandbox())
+
+		// Skip if container is in the delete list
+		for _, dc := range deleteContainers {
+			if c.ID() == dc.ID() {
+				log.Debugf(ctx, "DEBUG_FLAG skipped container %q because it's in the list of deleteContainers", containerName)
+				continue outer
+			}
+		}
+
+		// REMOVE THESE AFTER CUSTOMER TEST.
+		// Skip if container is not running
+		if c.State().Status == specs.StateStopped {
+			log.Debugf(ctx, "DEBUG_FLAG skipped container %q because it's not running", containerName)
+		}
+		// Skip if container has no CPU specification
+		if isContainerCPUsSpecEmpty(&cSpec) {
+			log.Debugf(ctx, "DEBUG_FLAG skipped container %q because CPU.Cpus is empty", containerName)
+		}
+
+		// Skip if container is not high-performance
+		if !isHighPerformanceRuntime(sb.RuntimeHandler(), sb.Annotations()) {
+			log.Debugf(ctx, "DEBUG_FLAG skipped container %q because not high-performance", containerName)
+		}
+		// Skip if hooks should not run
+		if !shouldRunHooks(ctx, c.ID(), &cSpec, sb) {
+			log.Debugf(ctx, "DEBUG_FLAG skipped container %q because hooks disabled", containerName)
+		}
+		// REMOVE ABOVE AFTER CUSTOMER TEST.
+
+		if c.State().Status == specs.StateStopped ||
+			isContainerCPUsSpecEmpty(&cSpec) ||
+			!isHighPerformanceRuntime(sb.RuntimeHandler(), sb.Annotations()) ||
+			!shouldRunHooks(ctx, c.ID(), &cSpec, sb) {
+			continue
+		}
+
+		// Parse the CPUset of this container and remove the CPUset from the enabled CPU Set and add it to the
+		// disabled CPU set.
+		containerSet, err := cpuset.Parse(c.Spec().Linux.Resources.CPU.Cpus)
+		if err != nil {
+			return cpuset.CPUSet{}, cpuset.CPUSet{}, fmt.Errorf(
+				"failed to parse container %q CPUs %q: %w", c.ID(), c.Spec().Linux.Resources.CPU.Cpus, err)
+		}
+		enabledCPUSet = enabledCPUSet.Difference(containerSet)
+		disabledCPUSet = disabledCPUSet.Union(containerSet)
+		log.Debugf(ctx, "DEBUG_FLAG after container %s with CPUs %s enabled CPU set is %s", c.Name(), c.Spec().Linux.Resources.CPU.Cpus, enabledCPUSet)
+	}
+
+	return enabledCPUSet, disabledCPUSet, nil
+}
+
+// calcIRQSMPAffinityCPUs computes the CPU sets for IRQ SMP affinity management using a level-driven approach.
+// It determines three distinct CPU sets:
+//   - unmanaged: CPUs that should not be modified (e.g., infrastructure container CPUs)
+//   - enabled: CPUs where IRQ SMP affinity should be enabled
+//   - disabled: CPUs where IRQ SMP affinity should be disabled (typically for high-performance containers)
+//
+// The function reads the system's present CPUs from /sys/devices/system/cpu/present, excludes any configured
+// infrastructure container CPUs, then iterates through all containers to identify which CPUs require
+// IRQ affinity changes. The deleteContainers parameter is necessary because during container deletion,
+// the containers being deleted are still present in CRI-O's container list and must be excluded from
+// the calculation to achieve the correct final state.
+func (h *HighPerformanceHooks) calcIRQSMPAffinityCPUs(ctx context.Context, containerServer *lib.ContainerServer, deleteContainers []*oci.Container) (cpuset.CPUSet, cpuset.CPUSet, cpuset.CPUSet, error) {
+	// Calculate the unmanaged CPU set first.
+	unmanagedCPUSet, err := parseInfraCPUSet(containerServer)
+	if err != nil {
+		return cpuset.CPUSet{}, cpuset.CPUSet{}, cpuset.CPUSet{}, err
+	}
+
+	// Next, read and parse the set of present CPUs.
+	presentCPUSet, err := h.readPresentCPUSet()
+	if err != nil {
+		return cpuset.CPUSet{}, cpuset.CPUSet{}, cpuset.CPUSet{}, err
+	}
+
+	// Calculate enabled and disabled CPU sets based on container requirements.
+	enabledCPUSet, disabledCPUSet, err := calculateContainerCPUSets(ctx, containerServer, deleteContainers, presentCPUSet, unmanagedCPUSet)
+	if err != nil {
+		return cpuset.CPUSet{}, cpuset.CPUSet{}, cpuset.CPUSet{}, err
+	}
+
+	return unmanagedCPUSet, enabledCPUSet, disabledCPUSet, nil
+}
+
+// writeIRQAffinityFiles writes the IRQ SMP affinity file and IRQ balance config file.
+// It handles rollback of the SMP affinity file if the config file update fails.
+func (h *HighPerformanceHooks) writeIRQAffinityFiles(ctx context.Context, newSMPSetting, newBalanceSetting, originalSMPSetting string) error {
+	if err := os.WriteFile(h.irqSMPAffinityFile, []byte(newSMPSetting), 0o644); err != nil {
+		return fmt.Errorf("failed to write IRQ SMP affinity file %q: %w", h.irqSMPAffinityFile, err)
+	}
+
+	// Nothing else to do if irq balance config file does not exist.
+	if !fileExists(h.irqBalanceConfigFile) {
+		return nil
+	}
+
+	if err := updateIrqBalanceConfigFile(h.irqBalanceConfigFile, newBalanceSetting); err != nil {
+		// Rollback IRQ SMP affinity file to maintain consistency
+		if rollbackErr := os.WriteFile(h.irqSMPAffinityFile, []byte(originalSMPSetting), 0o644); rollbackErr != nil {
+			log.Errorf(ctx, "Failed to rollback IRQ SMP affinity file after config update failure: %v", rollbackErr)
+		}
+		return fmt.Errorf("failed to update IRQ balance config file %q: %w", h.irqBalanceConfigFile, err)
+	}
+
+	return nil
 }

@@ -26,8 +26,8 @@
 %global service_name crio
 
 Name: %{repo}
-Version: 1.26.0
-Release: 1.ci%{?dist}
+Version: 1.31.10
+Release: 1.4187930ab%{?dist}
 Summary: Kubernetes Container Runtime Interface for OCI-based containers
 License: ASL 2.0
 URL: %{git0}

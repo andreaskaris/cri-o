@@ -606,7 +606,6 @@ func WrapSignatureCRIErrorIfNeeded(err error) error {
 		policyErr    signature.PolicyRequirementError
 		signatureErr signature.InvalidSignatureError
 	)
-
 	if errors.As(err, &policyErr) || errors.As(err, &signatureErr) {
 		return fmt.Errorf("%w: %w", crierrors.ErrSignatureValidationFailed, err)
 	}
@@ -680,6 +679,7 @@ func pullImageChild() {
 	go formatPullImageOutputItemGoroutine(os.Stdout, output, outputWritten)
 
 	progress := make(chan types.ProgressProperties)
+
 	go func() {
 		for p := range progress {
 			output <- pullImageOutputItem{Progress: &p}
@@ -873,26 +873,24 @@ func pullImageImplementation(ctx context.Context, lookup *imageLookupService, st
 		return RegistryImageReference{}, err
 	}
 
-	manifestBytes, err := ociartifact.NewStore(store.GraphRoot(), &srcSystemContext).PullManifest(ctx, srcRef, &ociartifact.PullOptions{CopyOptions: &libimage.CopyOptions{
+	manifestBytes, err := copy.Image(ctx, policyContext, destRef, srcRef, &copy.Options{
+		SourceCtx:        &srcSystemContext,
+		DestinationCtx:   options.DestinationCtx,
 		OciDecryptConfig: options.OciDecryptConfig,
+		ProgressInterval: options.ProgressInterval,
 		Progress:         options.Progress,
-		RemoveSignatures: true, // signature is not supported for OCI layout dest
-	}})
+	})
 	if err != nil {
-		if !errors.Is(err, ociartifact.ErrIsAnImage) {
-			return RegistryImageReference{}, fmt.Errorf("unable to try pulling possible OCI artifact: %w", err)
+		artifactManifestBytes, artifactErr := ociartifact.NewStore(store.GraphRoot(), &srcSystemContext).PullManifest(ctx, srcRef, &ociartifact.PullOptions{CopyOptions: &libimage.CopyOptions{
+			OciDecryptConfig: options.OciDecryptConfig,
+			Progress:         options.Progress,
+			RemoveSignatures: true, // signature is not supported for OCI layout dest
+		}})
+		if artifactErr != nil {
+			return RegistryImageReference{}, fmt.Errorf("unable to pull image or OCI artifact: pull image err: %w; artifact err: %w", err, artifactErr)
 		}
 
-		manifestBytes, err = copy.Image(ctx, policyContext, destRef, srcRef, &copy.Options{
-			SourceCtx:        &srcSystemContext,
-			DestinationCtx:   options.DestinationCtx,
-			OciDecryptConfig: options.OciDecryptConfig,
-			ProgressInterval: options.ProgressInterval,
-			Progress:         options.Progress,
-		})
-		if err != nil {
-			return RegistryImageReference{}, err
-		}
+		manifestBytes = artifactManifestBytes
 	}
 
 	manifestDigest, err := manifest.Digest(manifestBytes)
@@ -1017,11 +1015,13 @@ func (svc *imageService) CandidatesForPotentiallyShortImageName(systemContext *t
 		sc = *systemContext // A shallow copy
 	}
 
-	disabled := types.ShortNameModeDisabled
-	sc.ShortNameMode = &disabled
-
 	resolved, err := shortnames.Resolve(&sc, imageName)
 	if err != nil {
+		// Error is not very clear in this context, and unfortunately is also not a variable.
+		if strings.Contains(err.Error(), "short-name resolution enforced but cannot prompt without a TTY") {
+			return nil, fmt.Errorf("short name mode is enforcing, but image name %s returns ambiguous list", imageName)
+		}
+
 		return nil, err
 	}
 
@@ -1080,6 +1080,10 @@ func GetImageService(ctx context.Context, store storage.Store, storageTransport 
 		ctx:                  ctx,
 		config:               serverConfig,
 		regexForPinnedImages: CompileRegexpsForPinnedImages(serverConfig.PinnedImages),
+	}
+
+	if len(serverConfig.InsecureRegistries) > 0 {
+		log.Warnf(ctx, "Insecure registries option is deprecated and will not have any effect in a future release")
 	}
 
 	serverConfig.InsecureRegistries = append(serverConfig.InsecureRegistries, "127.0.0.0/8")

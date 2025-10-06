@@ -779,6 +779,95 @@ var _ = t.Describe("Config", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError("no_sync_log is only allowed with runtime type 'oci', runtime type is 'vm'"))
 		})
+
+		It("should disallow stream_websockets for the 'oci' runtime", func() {
+			sut.Runtimes[config.DefaultRuntime] = &config.RuntimeHandler{
+				RuntimePath:      validFilePath,
+				RuntimeType:      config.DefaultRuntimeType,
+				StreamWebsockets: true,
+			}
+
+			err := sut.Runtimes[config.DefaultRuntime].ValidateWebsocketStreaming(config.DefaultRuntime)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(MatchError(`only the 'runtime_type = "pod"' supports websocket streaming, not "oci" (runtime "crun")`))
+		})
+
+		It("should allow 'stream_websockets == false' for the 'oci' runtime", func() {
+			sut.Runtimes[config.DefaultRuntime] = &config.RuntimeHandler{
+				RuntimePath:      validFilePath,
+				RuntimeType:      config.DefaultRuntimeType,
+				StreamWebsockets: false,
+			}
+
+			err := sut.Runtimes[config.DefaultRuntime].ValidateWebsocketStreaming(config.DefaultRuntime)
+
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		conmonrsFakeBinary := func(command string) (name string) {
+			file, err := os.CreateTemp("", "conmonrs-fake-*")
+			Expect(err).NotTo(HaveOccurred())
+
+			err = file.Chmod(0o755)
+			Expect(err).NotTo(HaveOccurred())
+
+			_, err = file.WriteString("#!/bin/sh\n" + command)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = file.Close()
+			Expect(err).NotTo(HaveOccurred())
+
+			return file.Name()
+		}
+
+		It("should support streaming websockets if conmon-rs is >= v0.7.0", func() {
+			fileName := conmonrsFakeBinary("echo '{ \"version\": \"0.7.0\" }'")
+			defer os.RemoveAll(fileName)
+
+			sut.Runtimes[config.DefaultRuntime] = &config.RuntimeHandler{
+				RuntimePath:      validFilePath,
+				RuntimeType:      config.RuntimeTypePod,
+				StreamWebsockets: true,
+				MonitorPath:      fileName,
+			}
+
+			err := sut.Runtimes[config.DefaultRuntime].ValidateWebsocketStreaming(config.DefaultRuntime)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sut.Runtimes[config.DefaultRuntime].StreamWebsockets).To(BeTrue())
+		})
+
+		It("should disable streaming websockets if conmon-rs is < v0.7.0", func() {
+			fileName := conmonrsFakeBinary("echo 'error: unexpected argument' && exit 1")
+			defer os.RemoveAll(fileName)
+
+			sut.Runtimes[config.DefaultRuntime] = &config.RuntimeHandler{
+				RuntimePath:      validFilePath,
+				RuntimeType:      config.RuntimeTypePod,
+				StreamWebsockets: true,
+				MonitorPath:      fileName,
+			}
+
+			err := sut.Runtimes[config.DefaultRuntime].ValidateWebsocketStreaming(config.DefaultRuntime)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sut.Runtimes[config.DefaultRuntime].StreamWebsockets).To(BeFalse())
+		})
+
+		It("should not disable streaming websockets if conmon-rs is version is not retrievable", func() {
+			fileName := conmonrsFakeBinary("exit 1")
+			defer os.RemoveAll(fileName)
+
+			sut.Runtimes[config.DefaultRuntime] = &config.RuntimeHandler{
+				RuntimePath:      validFilePath,
+				RuntimeType:      config.RuntimeTypePod,
+				StreamWebsockets: true,
+				MonitorPath:      fileName,
+			}
+
+			err := sut.Runtimes[config.DefaultRuntime].ValidateWebsocketStreaming(config.DefaultRuntime)
+			Expect(err).To(HaveOccurred())
+			Expect(sut.Runtimes[config.DefaultRuntime].StreamWebsockets).To(BeTrue())
+		})
 	})
 
 	t.Describe("ValidateConmonPath", func() {
@@ -841,18 +930,39 @@ var _ = t.Describe("Config", func() {
 
 		It("should succeed on execution and writing permissions", func() {
 			// Given
-			sut.SignaturePolicyDir = os.TempDir()
+			signaturePolicyDir := t.MustTempDir("signature-policy-dir-")
+			Expect(os.RemoveAll(signaturePolicyDir)).NotTo(HaveOccurred())
+			sut.SignaturePolicyDir = signaturePolicyDir
+
+			namespacedAuthDir := t.MustTempDir("namespaced-auth-dir-")
+			Expect(os.RemoveAll(namespacedAuthDir)).NotTo(HaveOccurred())
+			sut.NamespacedAuthDir = namespacedAuthDir
 
 			// When
 			err := sut.ImageConfig.Validate(true)
 
 			// Then
 			Expect(err).ToNot(HaveOccurred())
+			for _, dir := range []string{signaturePolicyDir, namespacedAuthDir} {
+				_, err := os.Stat(dir)
+				Expect(err).NotTo(HaveOccurred())
+			}
 		})
 
 		It("should fail when SignaturePolicyDir is not absolute", func() {
 			// Given
 			sut.SignaturePolicyDir = "./wrong/path"
+
+			// When
+			err := sut.ImageConfig.Validate(false)
+
+			// Then
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should fail when NamespacedAuthDir is not absolute", func() {
+			// Given
+			sut.NamespacedAuthDir = "./wrong/path"
 
 			// When
 			err := sut.ImageConfig.Validate(false)

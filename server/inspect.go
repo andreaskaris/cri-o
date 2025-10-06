@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	json "github.com/json-iterator/go"
 	"github.com/sirupsen/logrus"
+	"k8s.io/utils/ptr"
 
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/log"
@@ -115,7 +116,7 @@ func (s *Server) getContainerInfo(ctx context.Context, id string, getContainerFu
 		image = someNameOfTheImage.StringForOutOfProcessConsumptionOnly()
 	}
 
-	imageRef := ctr.CRIContainer().ImageRef
+	imageRef := ctr.CRIContainer().GetImageRef()
 
 	return types.ContainerInfo{
 		Name:            ctr.Name(),
@@ -130,6 +131,7 @@ func (s *Server) getContainerInfo(ctx context.Context, id string, getContainerFu
 		LogPath:         ctr.LogPath(),
 		Sandbox:         ctr.Sandbox(),
 		IPs:             sb.IPs(),
+		HostNetwork:     ptr.To(sb.HostNetwork()),
 	}, nil
 }
 
@@ -312,6 +314,7 @@ func (s *Server) GetExtendInterfaceMux(enableProfile bool) *chi.Mux {
 		}
 
 		defer os.Remove(f.Name())
+
 		debug.WriteHeapDump(f.Fd())
 
 		if _, err := f.Seek(0, 0); err != nil {

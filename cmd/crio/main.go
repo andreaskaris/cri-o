@@ -309,6 +309,11 @@ func main() {
 			logrus.Infof("FLAG: --%s=\"%v\"\n", flagName, flagValue)
 		}
 
+		// TODO: delete this check in future releases
+		if _, ok := os.LookupEnv("CONTAINER_INCLUDED_POD_METRCIS"); ok {
+			logrus.Warnf("CONTAINER_INCLUDED_POD_METRCIS (typo) will be ineffective in future releases. Use CONTAINER_INCLUDED_POD_METRICS instead.")
+		}
+
 		// Print the current configuration.
 		tomlConfig, err := config.ToString()
 		if err != nil {
@@ -452,6 +457,7 @@ func main() {
 		}()
 
 		serverCloseCh := make(chan struct{})
+
 		go func() {
 			defer close(serverCloseCh)
 
@@ -463,6 +469,7 @@ func main() {
 		}()
 
 		streamServerCloseCh := crioServer.StreamingServerCloseChan()
+
 		serverMonitorsCh := crioServer.MonitorsCloseChan()
 		select {
 		case <-streamServerCloseCh:
@@ -501,6 +508,7 @@ func main() {
 			}
 
 			defer file.Close()
+
 			runtime.GC()
 
 			if err := pprof.WriteHeapProfile(file); err != nil {
@@ -510,7 +518,6 @@ func main() {
 
 		return nil
 	}
-
 	if err := app.Run(os.Args); err != nil {
 		logrus.Fatal(err)
 	}

@@ -13,7 +13,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"sigs.k8s.io/release-sdk/git"
 	"sigs.k8s.io/release-utils/command"
-	"sigs.k8s.io/release-utils/util"
+	"sigs.k8s.io/release-utils/helpers"
 
 	"github.com/cri-o/cri-o/internal/version"
 )
@@ -92,14 +92,14 @@ func run() error {
 	// Check if we're on a tag and adapt variables if necessary
 	bundleVersion := head
 	shortHead := head[:7]
-	endRev := util.AddTagPrefix(version.Version)
+	endRev := helpers.AddTagPrefix(version.Version)
 
 	startVersion, err := startVersionFromCurrent(version.Version)
 	if err != nil {
 		return fmt.Errorf("parsing start version: %w", err)
 	}
 
-	startTag := util.AddTagPrefix(startVersion)
+	startTag := helpers.AddTagPrefix(startVersion)
 
 	if output, err := command.New(
 		"git", "describe", "--tags", "--exact-match",
@@ -109,7 +109,7 @@ func run() error {
 		bundleVersion = foundTag
 		shortHead = foundTag
 		endRev = foundTag
-		startTag = util.AddTagPrefix(decVersion(foundTag))
+		startTag = helpers.AddTagPrefix(decVersion(foundTag))
 	} else {
 		logrus.Infof("Not using git tag because `git describe` failed: %v", err)
 	}
@@ -160,10 +160,10 @@ To verify the artifact signatures via [cosign](https://github.com/sigstore/cosig
 `+"```"+`console
 > export COSIGN_EXPERIMENTAL=1
 > cosign verify-blob cri-o.amd64.%s.tar.gz \
-    --certificate-identity https://github.com/cri-o/cri-o/.github/workflows/test.yml@refs/tags/%s \
+    --certificate-identity https://github.com/cri-o/packaging/.github/workflows/obs.yml@refs/heads/main \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-    --certificate-github-workflow-repository cri-o/cri-o \
-    --certificate-github-workflow-ref refs/tags/%s \
+    --certificate-github-workflow-repository cri-o/packaging \
+    --certificate-github-workflow-ref refs/heads/main \
     --signature cri-o.amd64.%s.tar.gz.sig \
     --certificate cri-o.amd64.%s.tar.gz.cert
 `+"```"+`
@@ -225,10 +225,9 @@ To verify the bill of materials (SBOM) in [SPDX](https://spdx.org) format using 
 		bundleVersion, bundleVersion,
 		bundleVersion, bundleVersion,
 		bundleVersion, bundleVersion, bundleVersion,
-		bundleVersion, bundleVersion,
 		startTag,
 	); err != nil {
-		return fmt.Errorf("writing tmplate to file: %w", err)
+		return fmt.Errorf("writing template to file: %w", err)
 	}
 
 	logrus.Infof("Generating release notes")
@@ -377,7 +376,7 @@ func indexOfPrefix(prefix string, slice []string) int {
 }
 
 func decVersion(tag string) string {
-	sv, err := util.TagStringToSemver(strings.TrimSpace(tag))
+	sv, err := helpers.TagStringToSemver(strings.TrimSpace(tag))
 	if err != nil {
 		panic(err)
 	}

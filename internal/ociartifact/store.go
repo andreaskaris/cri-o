@@ -10,13 +10,13 @@ import (
 	"slices"
 	"strings"
 
-	modelSpec "github.com/CloudNativeAI/model-spec/specs-go/v1"
 	"github.com/containers/common/libimage"
 	"github.com/containers/image/v5/docker/reference"
 	"github.com/containers/image/v5/manifest"
 	"github.com/containers/image/v5/oci/layout"
 	"github.com/containers/image/v5/pkg/blobinfocache"
 	"github.com/containers/image/v5/types"
+	modelSpec "github.com/modelpack/model-spec/specs-go/v1"
 	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -340,6 +340,8 @@ func (s *Store) buildArtifact(ctx context.Context, item *layout.ListResult) (*Ar
 		namedRef, err := reference.ParseNormalizedNamed(val)
 		if err != nil {
 			log.Warnf(ctx, "Failed to parse annotation ref %s with the error %s", val, err)
+
+			namedRef = unknownRef{}
 		}
 
 		artifact.namedRef = namedRef

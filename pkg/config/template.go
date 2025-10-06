@@ -554,6 +554,11 @@ func initCrioTemplateConfig(c *Config) ([]*templateConfigValue, error) {
 			isDefaultValue: simpleEqual(dc.PullProgressTimeout, c.PullProgressTimeout),
 		},
 		{
+			templateString: templateStringCrioImageShortNameMode,
+			group:          crioImageConfig,
+			isDefaultValue: simpleEqual(dc.ShortNameMode, c.ShortNameMode),
+		},
+		{
 			templateString: templateStringOCIArtifactMountSupport,
 			group:          crioImageConfig,
 			isDefaultValue: simpleEqual(dc.OCIArtifactMountSupport, c.OCIArtifactMountSupport),
@@ -672,6 +677,11 @@ func initCrioTemplateConfig(c *Config) ([]*templateConfigValue, error) {
 			templateString: templateStringCrioNRIPluginRequestTimeout,
 			group:          crioNRIConfig,
 			isDefaultValue: simpleEqual(dc.NRI.PluginRequestTimeout, c.NRI.PluginRequestTimeout),
+		},
+		{
+			templateString: templateStringCrioNRIDefaultValidator,
+			group:          crioNRIConfig,
+			isDefaultValue: dc.NRI.IsDefaultValidatorDefaultConfig(),
 		},
 	}
 
@@ -936,8 +946,8 @@ const templateStringCrioRuntimeSelinux = `# If true, SELinux will be used for po
 `
 
 const templateStringCrioRuntimeSeccompProfile = `# Path to the seccomp.json profile which is used as the default seccomp profile
-# for the runtime. If not specified, then the internal default seccomp profile
-# will be used. This option supports live configuration reload.
+# for the runtime. If not specified or set to "", then the internal default seccomp profile will be used.
+# This option supports live configuration reload.
 {{ $.Comment }}seccomp_profile = "{{ .SeccompProfile }}"
 
 `
@@ -1245,6 +1255,8 @@ const templateStringCrioRuntimeRuntimesRuntimeHandler = `# The "crio.runtime.run
 # platform_runtime_paths = { "os/arch" = "/path/to/binary" }
 # no_sync_log = false
 # default_annotations = {}
+# stream_websockets = false
+# seccomp_profile = ""
 # Where:
 # - runtime-handler: Name used to identify the runtime.
 # - runtime_path (optional, string): Absolute path to the runtime executable in
@@ -1287,8 +1299,13 @@ const templateStringCrioRuntimeRuntimesRuntimeHandler = `# The "crio.runtime.run
 #   Replaces deprecated option "conmon_cgroup".
 # - monitor_exec_cgroup (optional, string): If set to "container", indicates exec probes
 #   should be moved to the container's cgroup
-# - monitor_env (optional, array of strings): Environment variables to pass to the montior.
+# - monitor_env (optional, array of strings): Environment variables to pass to the monitor.
 #   Replaces deprecated option "conmon_env".
+#   When using the pod runtime and conmon-rs, then the monitor_env can be used to further configure
+#   conmon-rs by using:
+#     - LOG_DRIVER=[none,systemd,stdout] - Enable logging to the configured target, defaults to none.
+#     - HEAPTRACK_OUTPUT_PATH=/path/to/dir - Enable heaptrack profiling and save the files to the set directory.
+#     - HEAPTRACK_BINARY_PATH=/path/to/heaptrack - Enable heaptrack profiling and use set heaptrack binary.
 # - platform_runtime_paths (optional, map): A mapping of platforms to the corresponding
 #   runtime executable paths for the runtime handler.
 # - container_min_memory (optional, string): The minimum memory that must be set for a container.
@@ -1298,6 +1315,11 @@ const templateStringCrioRuntimeRuntimesRuntimeHandler = `# The "crio.runtime.run
 #   This option is only valid for the 'oci' runtime type. Setting this option to true can cause data loss, e.g.
 #   when a machine crash happens.
 # - default_annotations (optional, map): Default annotations if not overridden by the pod spec.
+# - stream_websockets (optional, bool): Enable the WebSocket protocol for container exec, attach and port forward.
+# - seccomp_profile (optional, string): The absolute path of the seccomp.json profile which is used as the default
+#   seccomp profile for the runtime.
+#   If not specified or set to "", the runtime seccomp_profile will be used.
+#   If that is also not specified or set to "", the internal default seccomp profile will be applied.
 #
 # Using the seccomp notifier feature:
 #
@@ -1487,6 +1509,7 @@ const templateStringCrioImageSignaturePolicyDir = `# Root path for pod namespace
 const templateStringCrioImageInsecureRegistries = `# List of registries to skip TLS verification for pulling images. Please
 # consider configuring the registries via /etc/containers/registries.conf before
 # changing them here.
+# This option is deprecated. Use registries.conf file instead.
 {{ $.Comment }}insecure_registries = [
 {{ range $opt := .InsecureRegistries }}{{ $.Comment }}{{ printf "\t%q,\n" $opt }}{{ end }}{{ $.Comment }}]
 
@@ -1513,6 +1536,14 @@ const templateStringCrioImagePullProgressTimeout = `# The timeout for an image p
 # gets canceled. This value will be also used for calculating the pull progress interval to pull_progress_timeout / 10.
 # Can be set to 0 to disable the timeout as well as the progress output.
 {{ $.Comment }}pull_progress_timeout = "{{ .PullProgressTimeout }}"
+
+`
+
+const templateStringCrioImageShortNameMode = `# The mode of short name resolution.
+# The valid values are "enforcing" and "disabled", and the default is "enforcing".
+# If "enforcing", an image pull will fail if a short name is used, but the results are ambiguous.
+# If "disabled", the first result will be chosen.
+{{ $.Comment }}short_name_mode = "{{ .ShortNameMode }}"
 
 `
 
@@ -1667,5 +1698,31 @@ const templateStringCrioNRIPluginRegistrationTimeout = `# Timeout for a plugin t
 
 const templateStringCrioNRIPluginRequestTimeout = `# Timeout for a plugin to handle an NRI request.
 {{ $.Comment }}nri_plugin_request_timeout = "{{ .NRI.PluginRequestTimeout }}"
+
+`
+
+const templateStringCrioNRIDefaultValidator = `# NRI default validator configuration.
+# If enabled, the builtin default validator can be used to reject a container if some
+# NRI plugin requested a restricted adjustment. Currently the following adjustments
+# can be restricted/rejected:
+# - OCI hook injection
+# - adjustment of runtime default seccomp profile
+# - adjustment of unconfied seccomp profile
+# - adjustment of a custom seccomp profile
+# - adjustment of linux namespaces
+# Additionally, the default validator can be used to reject container creation if any
+# of a required set of plugins has not processed a container creation request, unless
+# the container has been annotated to tolerate a missing plugin.
+#
+{{ $.Comment }}[crio.nri.default_validator]
+{{ $.Comment }}nri_enable_default_validator = {{ .NRI.DefaultValidator.Enable }}
+{{ $.Comment }}nri_validator_reject_oci_hook_adjustment = {{ .NRI.DefaultValidator.RejectOCIHookAdjustment }}
+{{ $.Comment }}nri_validator_reject_runtime_default_seccomp_adjustment = {{ .NRI.DefaultValidator.RejectRuntimeDefaultSeccompAdjustment }}
+{{ $.Comment }}nri_validator_reject_unconfined_seccomp_adjustment = {{ .NRI.DefaultValidator.RejectUnconfinedSeccompAdjustment }}
+{{ $.Comment }}nri_validator_reject_custom_seccomp_adjustment = {{ .NRI.DefaultValidator.RejectCustomSeccompAdjustment }}
+{{ $.Comment }}nri_validator_reject_namespace_adjustment = {{ .NRI.DefaultValidator.RejectNamespaceAdjustment }}
+{{ $.Comment }}nri_validator_required_plugins = [
+{{ range $p := .NRI.DefaultValidator.RequiredPlugins }}{{ $.Comment }}{{ printf "\t%q,\n" $p }}{{ end }}{{ $.Comment }}]
+{{ $.Comment }}nri_validator_tolerate_missing_plugins_annotation = "{{ .NRI.DefaultValidator.TolerateMissingAnnotation }}"
 
 `

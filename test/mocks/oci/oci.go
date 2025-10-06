@@ -189,6 +189,20 @@ func (mr *MockRuntimeImplMockRecorder) PortForwardContainer(arg0, arg1, arg2, ar
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PortForwardContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).PortForwardContainer), arg0, arg1, arg2, arg3, arg4)
 }
 
+// ProbeMonitor mocks base method.
+func (m *MockRuntimeImpl) ProbeMonitor(arg0 context.Context, arg1 *oci.Container) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ProbeMonitor", arg0, arg1)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ProbeMonitor indicates an expected call of ProbeMonitor.
+func (mr *MockRuntimeImplMockRecorder) ProbeMonitor(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ProbeMonitor", reflect.TypeOf((*MockRuntimeImpl)(nil).ProbeMonitor), arg0, arg1)
+}
+
 // ReopenContainerLog mocks base method.
 func (m *MockRuntimeImpl) ReopenContainerLog(arg0 context.Context, arg1 *oci.Container) error {
 	m.ctrl.T.Helper()
@@ -215,6 +229,36 @@ func (m *MockRuntimeImpl) RestoreContainer(arg0 context.Context, arg1 *oci.Conta
 func (mr *MockRuntimeImplMockRecorder) RestoreContainer(arg0, arg1, arg2, arg3 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RestoreContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).RestoreContainer), arg0, arg1, arg2, arg3)
+}
+
+// ServeAttachContainer mocks base method.
+func (m *MockRuntimeImpl) ServeAttachContainer(arg0 context.Context, arg1 *oci.Container, arg2, arg3, arg4 bool) (string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ServeAttachContainer", arg0, arg1, arg2, arg3, arg4)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ServeAttachContainer indicates an expected call of ServeAttachContainer.
+func (mr *MockRuntimeImplMockRecorder) ServeAttachContainer(arg0, arg1, arg2, arg3, arg4 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeAttachContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).ServeAttachContainer), arg0, arg1, arg2, arg3, arg4)
+}
+
+// ServeExecContainer mocks base method.
+func (m *MockRuntimeImpl) ServeExecContainer(arg0 context.Context, arg1 *oci.Container, arg2 []string, arg3, arg4, arg5, arg6 bool) (string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ServeExecContainer", arg0, arg1, arg2, arg3, arg4, arg5, arg6)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ServeExecContainer indicates an expected call of ServeExecContainer.
+func (mr *MockRuntimeImplMockRecorder) ServeExecContainer(arg0, arg1, arg2, arg3, arg4, arg5, arg6 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServeExecContainer", reflect.TypeOf((*MockRuntimeImpl)(nil).ServeExecContainer), arg0, arg1, arg2, arg3, arg4, arg5, arg6)
 }
 
 // SignalContainer mocks base method.

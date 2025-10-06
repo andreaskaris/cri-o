@@ -78,7 +78,7 @@ func (ss *StatsServer) updateSandbox(sb *sandbox.Sandbox) *types.PodSandboxStats
 		ss.populateWritableLayer(cStats, c)
 
 		if oldcStats, ok := ss.ctrStats[c.ID()]; ok {
-			updateUsageNanoCores(oldcStats.Cpu, cStats.Cpu)
+			updateUsageNanoCores(oldcStats.GetCpu(), cStats.GetCpu())
 		}
 
 		containerStats = append(containerStats, cStats)
@@ -92,7 +92,7 @@ func (ss *StatsServer) updateSandbox(sb *sandbox.Sandbox) *types.PodSandboxStats
 	sandboxMetrics.metric.ContainerMetrics = containerMetrics
 
 	if old, ok := ss.sboxStats[sb.ID()]; ok {
-		updateUsageNanoCores(old.Linux.Cpu, sandboxStats.Linux.Cpu)
+		updateUsageNanoCores(old.GetLinux().GetCpu(), sandboxStats.GetLinux().GetCpu())
 	}
 
 	ss.sboxStats[sb.ID()] = sandboxStats
@@ -124,7 +124,7 @@ func (ss *StatsServer) updateContainerStats(c *oci.Container, sb *sandbox.Sandbo
 	ss.populateWritableLayer(cStats, c)
 
 	if oldcStats, ok := ss.ctrStats[c.ID()]; ok {
-		updateUsageNanoCores(oldcStats.Cpu, cStats.Cpu)
+		updateUsageNanoCores(oldcStats.GetCpu(), cStats.GetCpu())
 	}
 
 	ss.ctrStats[c.ID()] = cStats
@@ -240,6 +240,10 @@ func (ss *StatsServer) containerMetricsFromCgStats(sb *sandbox.Sandbox, c *oci.C
 			if cpuMetrics := generateSandboxCPUMetrics(sb, cgstats.CPU); cpuMetrics != nil {
 				metrics = append(metrics, cpuMetrics...)
 			}
+		case HugetlbMetrics:
+			if hugetlbMetrics := generateSandboxHugetlbMetrics(sb, cgstats.Hugetlb); hugetlbMetrics != nil {
+				metrics = append(metrics, hugetlbMetrics...)
+			}
 		case MemoryMetrics:
 			if memoryMetrics := generateSandboxMemoryMetrics(sb, cgstats.Memory); memoryMetrics != nil {
 				metrics = append(metrics, memoryMetrics...)
@@ -263,6 +267,10 @@ func (ss *StatsServer) containerMetricsFromCgStats(sb *sandbox.Sandbox, c *oci.C
 			metrics = append(metrics, oomMetrics...)
 		case NetworkMetrics:
 			continue // Network metrics are collected at the pod level only.
+		case ProcessMetrics:
+			if processMetrics := generateSandboxProcessMetrics(sb, cgstats.Pid); processMetrics != nil {
+				metrics = append(metrics, processMetrics...)
+			}
 		default:
 			log.Warnf(ss.ctx, "Unknown metric: %s", m)
 		}

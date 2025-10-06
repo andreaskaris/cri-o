@@ -12,16 +12,16 @@ import (
 
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
-	"github.com/cri-o/cri-o/internal/runtimehandlerhooks"
 )
 
 // StopContainer stops a running container with a grace period (i.e., timeout).
 func (s *Server) StopContainer(ctx context.Context, req *types.StopContainerRequest) (*types.StopContainerResponse, error) {
 	ctx, span := log.StartSpan(ctx)
 	defer span.End()
-	log.Infof(ctx, "Stopping container: %s (timeout: %ds)", req.ContainerId, req.Timeout)
 
-	c, err := s.GetContainerFromShortID(ctx, req.ContainerId)
+	log.Infof(ctx, "Stopping container: %s (timeout: %ds)", req.GetContainerId(), req.GetTimeout())
+
+	c, err := s.GetContainerFromShortID(ctx, req.GetContainerId())
 	if err != nil {
 		// The StopContainer RPC is idempotent, and must not return an error if
 		// the container has already been stopped. Ref:
@@ -30,10 +30,10 @@ func (s *Server) StopContainer(ctx context.Context, req *types.StopContainerRequ
 			return &types.StopContainerResponse{}, nil
 		}
 
-		return nil, status.Errorf(codes.NotFound, "could not find container %q: %v", req.ContainerId, err)
+		return nil, status.Errorf(codes.NotFound, "could not find container %q: %v", req.GetContainerId(), err)
 	}
 
-	if err := s.stopContainer(ctx, c, req.Timeout); err != nil {
+	if err := s.stopContainer(ctx, c, req.GetTimeout()); err != nil {
 		return nil, err
 	}
 
@@ -49,11 +49,7 @@ func (s *Server) stopContainer(ctx context.Context, ctr *oci.Container, timeout 
 
 	sb := s.getSandbox(ctx, ctr.Sandbox())
 
-	hooks, err := runtimehandlerhooks.GetRuntimeHandlerHooks(ctx, &s.config, sb.RuntimeHandler(), sb.Annotations())
-	if err != nil {
-		return fmt.Errorf("failed to get runtime handler %q hooks", sb.RuntimeHandler())
-	}
-
+	hooks := s.hooksRetriever.Get(ctx, sb.RuntimeHandler(), sb.Annotations())
 	if hooks != nil {
 		if err := hooks.PreStop(ctx, ctr, sb); err != nil {
 			return fmt.Errorf("failed to run pre-stop hook for container %q: %w", ctr.ID(), err)

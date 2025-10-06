@@ -213,6 +213,7 @@ func (r *runtimeVM) CreateContainer(ctx context.Context, c *Container, cgroupPar
 	}
 
 	createdCh := make(chan error)
+
 	go func() {
 		// Create the container
 		if resp, err := r.task.Create(r.ctx, request); err != nil {
@@ -390,6 +391,7 @@ func (r *runtimeVM) ExecSyncContainer(ctx context.Context, c *Container, command
 	defer log.Debugf(ctx, "RuntimeVM.ExecSyncContainer() end")
 
 	var stdoutBuf, stderrBuf bytes.Buffer
+
 	stdout := &writeCloserWrapper{limitWriter(&stdoutBuf, maxExecSyncSize)}
 	stderr := &writeCloserWrapper{limitWriter(&stderrBuf, maxExecSyncSize)}
 
@@ -474,6 +476,7 @@ func (r *runtimeVM) execContainerCommon(ctx context.Context, c *Container, cmd [
 
 	// chan to notify that can call runtime's CloseIO API
 	closeIOChan := make(chan bool)
+
 	defer func() {
 		if closeIOChan != nil {
 			close(closeIOChan)
@@ -559,6 +562,7 @@ func (r *runtimeVM) execContainerCommon(ctx context.Context, c *Container, cmd [
 	}
 
 	execCh := make(chan error)
+
 	go func() {
 		// Wait for the process to terminate
 		exitCode, err = r.wait(c.ID(), execID)
@@ -645,6 +649,7 @@ func (r *runtimeVM) StopContainer(ctx context.Context, c *Container, timeout int
 	defer cancel()
 
 	stopCh := make(chan error)
+
 	go func() {
 		// errdefs.ErrNotFound actually comes from a closed connection, which is expected
 		// when stopping the container, with the agent and the VM going off. In such case.
@@ -887,6 +892,7 @@ func (r *runtimeVM) restoreContainerIO(ctx context.Context, c *Container, state 
 
 		return nil
 	}
+
 	r.Unlock()
 
 	cioCfg := ctrio.Config{
@@ -942,29 +948,10 @@ func (r *runtimeVM) createContainerIO(ctx context.Context, c *Container, cioOpts
 		}
 	}()
 
-	f, err := os.OpenFile(c.LogPath(), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	stdout, stderr, err := r.createContainerLoggers(ctx, c.LogPath())
 	if err != nil {
 		return nil, err
 	}
-
-	var stdoutCh, stderrCh <-chan struct{}
-
-	wc := cioutil.NewSerialWriteCloser(f)
-	stdout, stdoutCh := cio.NewCRILogger(c.LogPath(), wc, cio.Stdout, -1)
-	stderr, stderrCh := cio.NewCRILogger(c.LogPath(), wc, cio.Stderr, -1)
-
-	go func() {
-		if stdoutCh != nil {
-			<-stdoutCh
-		}
-
-		if stderrCh != nil {
-			<-stderrCh
-		}
-
-		log.Debugf(ctx, "Finish redirecting log file %q, closing it", c.LogPath())
-		f.Close()
-	}()
 
 	containerIO.AddOutput(c.LogPath(), stdout, stderr)
 	containerIO.Pipe()
@@ -976,6 +963,35 @@ func (r *runtimeVM) createContainerIO(ctx context.Context, c *Container, cioOpts
 	r.Unlock()
 
 	return containerIO, nil
+}
+
+// createContainerLoggers creates container loggers and return write closer for stdout and stderr.
+func (r *runtimeVM) createContainerLoggers(ctx context.Context, logPath string) (stdout, stderr io.WriteCloser, err error) {
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var stdoutCh, stderrCh <-chan struct{}
+
+	wc := cioutil.NewSerialWriteCloser(f)
+	stdout, stdoutCh = cio.NewCRILogger(logPath, wc, cio.Stdout, -1)
+	stderr, stderrCh = cio.NewCRILogger(logPath, wc, cio.Stderr, -1)
+
+	go func() {
+		if stdoutCh != nil {
+			<-stdoutCh
+		}
+
+		if stderrCh != nil {
+			<-stderrCh
+		}
+
+		log.Debugf(ctx, "Finish redirecting log file %q, closing it", logPath)
+		f.Close()
+	}()
+
+	return stdout, stderr, nil
 }
 
 // PauseContainer pauses a container.
@@ -1074,6 +1090,14 @@ func metricsV1ToCgroupStats(ctx context.Context, m *cgroupsV1.Metrics) *cgmgr.Cg
 		)
 	}
 
+	hugetlbStats := map[string]cgmgr.HugetlbStats{}
+	for _, hugetlb := range m.Hugetlb {
+		hugetlbStats[hugetlb.Pagesize] = cgmgr.HugetlbStats{
+			Usage: hugetlb.Usage,
+			Max:   hugetlb.Max,
+		}
+	}
+
 	return &cgmgr.CgroupStats{
 		Memory: &cgmgr.MemoryStats{
 			Usage:           memUsage,
@@ -1101,6 +1125,7 @@ func metricsV1ToCgroupStats(ctx context.Context, m *cgroupsV1.Metrics) *cgmgr.Cg
 			ThrottlingActivePeriods: m.CPU.Throttling.Periods,
 			ThrottledPeriods:        m.CPU.Throttling.ThrottledPeriods,
 		},
+		Hugetlb: hugetlbStats,
 		Pid: &cgmgr.PidsStats{
 			Current: m.Pids.Current,
 			Limit:   m.Pids.Limit,
@@ -1127,6 +1152,14 @@ func metricsV2ToCgroupStats(ctx context.Context, m *cgroupsV2.Metrics) *cgmgr.Cg
 				"Unable to account working set stats: total_inactive_file (%d) > memory usage (%d)",
 				m.Memory.InactiveFile, memUsage,
 			)
+		}
+	}
+
+	hugetlbStats := map[string]cgmgr.HugetlbStats{}
+	for _, hugetlb := range m.Hugetlb {
+		hugetlbStats[hugetlb.Pagesize] = cgmgr.HugetlbStats{
+			Usage: hugetlb.Current,
+			Max:   hugetlb.Max,
 		}
 	}
 
@@ -1157,6 +1190,7 @@ func metricsV2ToCgroupStats(ctx context.Context, m *cgroupsV2.Metrics) *cgmgr.Cg
 			ThrottledPeriods:        m.CPU.NrThrottled,
 			ThrottledTime:           m.CPU.ThrottledUsec * 1000,
 		},
+		Hugetlb: hugetlbStats,
 		Pid: &cgmgr.PidsStats{
 			Current: m.Pids.Current,
 			Limit:   m.Pids.Limit,
@@ -1227,6 +1261,29 @@ func (r *runtimeVM) PortForwardContainer(ctx context.Context, c *Container, netN
 func (r *runtimeVM) ReopenContainerLog(ctx context.Context, c *Container) error {
 	log.Debugf(ctx, "RuntimeVM.ReopenContainerLog() start")
 	defer log.Debugf(ctx, "RuntimeVM.ReopenContainerLog() end")
+
+	r.Lock()
+	cInfo, ok := r.ctrs[c.ID()]
+	r.Unlock()
+
+	if !ok {
+		return errors.New("could not retrieve container information")
+	}
+
+	// Create new container logger and replace the existing ones.
+	stdoutWC, stderrWC, err := r.createContainerLoggers(ctx, c.LogPath())
+	if err != nil {
+		return err
+	}
+
+	oldStdoutWC, oldStderrWC := cInfo.cio.AddOutput(c.LogPath(), stdoutWC, stderrWC)
+	if oldStdoutWC != nil {
+		oldStdoutWC.Close()
+	}
+
+	if oldStderrWC != nil {
+		oldStderrWC.Close()
+	}
 
 	return nil
 }
@@ -1339,4 +1396,17 @@ func EncodeKataVirtualVolumeToBase64(ctx context.Context, volume *katavolume.Kat
 
 func (r *runtimeVM) IsContainerAlive(c *Container) bool {
 	return r.kill(c.ID(), "", 0, false) == nil
+}
+
+func (r *runtimeVM) ProbeMonitor(ctx context.Context, c *Container) error {
+	// Not implemented
+	return nil
+}
+
+func (r *runtimeVM) ServeExecContainer(context.Context, *Container, []string, bool, bool, bool, bool) (string, error) {
+	return "", nil
+}
+
+func (r *runtimeVM) ServeAttachContainer(context.Context, *Container, bool, bool, bool) (string, error) {
+	return "", nil
 }

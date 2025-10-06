@@ -6,9 +6,8 @@ import (
 	"syscall"
 	"time"
 
-	libctrcgroups "github.com/opencontainers/runc/libcontainer/cgroups"
-	"github.com/opencontainers/runc/libcontainer/cgroups/manager"
-	cgcfgs "github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/cgroups"
+	"github.com/opencontainers/cgroups/manager"
 
 	"github.com/cri-o/cri-o/internal/config/node"
 )
@@ -20,6 +19,7 @@ import (
 type CgroupStats struct {
 	Memory     *MemoryStats
 	CPU        *CPUStats
+	Hugetlb    map[string]HugetlbStats
 	Pid        *PidsStats
 	SystemNano int64
 }
@@ -59,6 +59,11 @@ type CPUStats struct {
 	ThrottledTime uint64
 }
 
+type HugetlbStats struct {
+	Usage uint64
+	Max   uint64
+}
+
 type PidsStats struct {
 	Current uint64
 	Limit   uint64
@@ -86,7 +91,7 @@ func MemLimitGivenSystem(cgroupLimit uint64) uint64 {
 	return cgroupLimit
 }
 
-func libctrManager(cgroup, parent string, systemd bool) (libctrcgroups.Manager, error) {
+func libctrManager(cgroup, parent string, systemd bool) (cgroups.Manager, error) {
 	if systemd {
 		parent = filepath.Base(parent)
 		if parent == "." {
@@ -96,10 +101,10 @@ func libctrManager(cgroup, parent string, systemd bool) (libctrcgroups.Manager, 
 		}
 	}
 
-	cg := &cgcfgs.Cgroup{
+	cg := &cgroups.Cgroup{
 		Name:   cgroup,
 		Parent: parent,
-		Resources: &cgcfgs.Resources{
+		Resources: &cgroups.Resources{
 			SkipDevices: true,
 		},
 		Systemd: systemd,
@@ -114,10 +119,11 @@ func libctrManager(cgroup, parent string, systemd bool) (libctrcgroups.Manager, 
 	return manager.New(cg)
 }
 
-func libctrStatsToCgroupStats(stats *libctrcgroups.Stats) *CgroupStats {
+func libctrStatsToCgroupStats(stats *cgroups.Stats) *CgroupStats {
 	return &CgroupStats{
-		Memory: cgroupMemStats(&stats.MemoryStats),
-		CPU:    cgroupCPUStats(&stats.CpuStats),
+		Memory:  cgroupMemStats(&stats.MemoryStats),
+		CPU:     cgroupCPUStats(&stats.CpuStats),
+		Hugetlb: cgroupHugetlbStats(stats.HugetlbStats),
 		Pid: &PidsStats{
 			Current: stats.PidsStats.Current,
 			Limit:   stats.PidsStats.Limit,
@@ -126,7 +132,7 @@ func libctrStatsToCgroupStats(stats *libctrcgroups.Stats) *CgroupStats {
 	}
 }
 
-func cgroupMemStats(memStats *libctrcgroups.MemoryStats) *MemoryStats {
+func cgroupMemStats(memStats *cgroups.MemoryStats) *MemoryStats {
 	var (
 		workingSetBytes  uint64
 		rssBytes         uint64
@@ -201,7 +207,7 @@ func cgroupMemStats(memStats *libctrcgroups.MemoryStats) *MemoryStats {
 	}
 }
 
-func cgroupCPUStats(cpuStats *libctrcgroups.CpuStats) *CPUStats {
+func cgroupCPUStats(cpuStats *cgroups.CpuStats) *CPUStats {
 	return &CPUStats{
 		TotalUsageNano:          cpuStats.CpuUsage.TotalUsage,
 		PerCPUUsage:             cpuStats.CpuUsage.PercpuUsage,
@@ -211,6 +217,19 @@ func cgroupCPUStats(cpuStats *libctrcgroups.CpuStats) *CPUStats {
 		ThrottledPeriods:        cpuStats.ThrottlingData.ThrottledPeriods,
 		ThrottledTime:           cpuStats.ThrottlingData.ThrottledTime,
 	}
+}
+
+func cgroupHugetlbStats(cgHugetlbStats map[string]cgroups.HugetlbStats) map[string]HugetlbStats {
+	hugetlbStats := map[string]HugetlbStats{}
+
+	for pagesize, hugetlb := range cgHugetlbStats {
+		hugetlbStats[pagesize] = HugetlbStats{
+			Usage: hugetlb.Usage,
+			Max:   hugetlb.MaxUsage,
+		}
+	}
+
+	return hugetlbStats
 }
 
 func isMemoryUnlimited(v uint64) bool {

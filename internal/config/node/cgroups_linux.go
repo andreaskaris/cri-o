@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/containers/common/pkg/cgroups"
-	libctrcgroups "github.com/opencontainers/runc/libcontainer/cgroups"
+	libctrcgroups "github.com/opencontainers/cgroups"
 )
 
 var (
@@ -27,6 +27,7 @@ var (
 
 func CgroupIsV2() bool {
 	var cgroupIsV2 bool
+
 	cgroupIsV2, cgroupIsV2Err = cgroups.IsCgroup2UnifiedMode()
 
 	return cgroupIsV2

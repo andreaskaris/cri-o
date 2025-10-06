@@ -36,6 +36,20 @@ var (
 	}
 )
 
+// HugeTLB metrics.
+var (
+	containerHugetlbUsageBytes = &types.MetricDescriptor{
+		Name:      "container_hugetlb_usage_bytes",
+		Help:      "Current hugepage usage",
+		LabelKeys: append(baseLabelKeys, "pagesize"),
+	}
+	containerHugetlbMaxUsageBytes = &types.MetricDescriptor{
+		Name:      "container_hugetlb_max_usage_bytes",
+		Help:      "Maximum hugepage usages recorded",
+		LabelKeys: append(baseLabelKeys, "pagesize"),
+	}
+)
+
 // Memory metrics.
 var (
 	containerMemoryCache = &types.MetricDescriptor{
@@ -146,6 +160,15 @@ var (
 	containerOomEventsTotal = &types.MetricDescriptor{
 		Name:      "container_oom_events_total",
 		Help:      "Count of out of memory events observed for the container",
+		LabelKeys: baseLabelKeys,
+	}
+)
+
+// Process metrics.
+var (
+	containerProcesses = &types.MetricDescriptor{
+		Name:      "container_processes",
+		Help:      "Number of processes running inside the container",
 		LabelKeys: baseLabelKeys,
 	}
 )

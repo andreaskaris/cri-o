@@ -384,6 +384,14 @@ runtime type. Setting this option to true can cause data loss, e.g. when a machi
 **default_annotations**={}
 A mapping of keys to values of annotations set on containers run by this runtime handler, if not overridden by the pod spec.
 
+**stream_websockets**=false
+Enable the WebSocket protocol for container exec, attach and port forward.
+conmon-rs (`runtime_type = "pod"`) supports this configuration for exec and attach. Forwarding ports will be supported in future releases.
+
+**seccomp_profile**=""
+Path to the seccomp.json profile which is used as the default seccomp profile for the runtime. If not specified, then the `crio.runtime` seccomp profile will be used.
+If that is also not specified, then the internal default seccomp profile will be used.
+
 ### CRIO.RUNTIME.WORKLOADS TABLE
 
 The "crio.runtime.workloads" table defines a list of workloads - a way to customize the behavior of a pod and container.
@@ -462,7 +470,7 @@ Default transport for pulling images from a remote container storage.
 **global_auth_file**=""
 The path to a file like /var/lib/kubelet/config.json holding credentials necessary for pulling images from secure registries.
 
-**pause_image**="registry.k8s.io/pause:3.10"
+**pause_image**="registry.k8s.io/pause:3.10.1"
 The on-registry image used to instantiate infra containers.
 The value should start with a registry host name.
 This option supports live configuration reload.
@@ -487,6 +495,7 @@ Controls how image volumes are handled. The valid values are mkdir, bind and ign
 
 **insecure_registries**=[]
 List of registries to skip TLS verification for pulling images.
+This option is deprecated. Use registries.conf instead.
 
 **big_files_temporary_dir**=""
 Path to the temporary directory to use for storing big files, used to store image blobs and data streams related to containers image management.
@@ -503,6 +512,12 @@ The timeout for an image pull to make progress until the pull operation gets can
 **oci_artifact_mount_support**=true
 This option is whether CRI-O enables OCI Artifact mount.
 If true, CRI-O can mount OCI artifacts as volumes.
+
+**short_name_mode**="enforcing"
+This option describes the short name mode.
+The valid values are "enforcing" and "disabled", and the default is "enforcing".
+If "enforcing", an image pull will fail if a short name is used, but the results are ambiguous.
+If "disabled", the first result will be chosen.
 
 ## CRIO.NETWORK TABLE
 
@@ -591,6 +606,34 @@ Timeout for a plugin to register itself with NRI.
 
 **nri_plugin_request_timeout**="2s"
 Timeout for a plugin to handle an NRI request.
+
+## CRIO.NRI.DEFAULT_VALIDATOR TABLE
+
+The `crio.nri.default_validator` table contains settings for default built-in NRI validator plugin, which can be used to restrict what types of modifications other NRI plugins can make to containers.
+
+**nri_enable_default_validator**=false
+Enable the default NRI validator plugin.
+
+**nri_validator_reject_oci_hook_adjustment**=false
+Reject NRI plugin adjustment of OCI Hooks.
+
+**nri_validator_reject_runtime_default_seccomp_adjustment**=false
+Reject NRI plugin adjustment of runtime default seccomp policy.
+
+**nri_validator_reject_unconfined_seccomp_adjustment**=false
+Reject NRI plugin adjustment of unconfined seccomp policy.
+
+**nri_validator_reject_custom_seccomp_adjustment**=false
+Reject NRI plugin adjustment of custom seccomp policy.
+
+**nri_validator_reject_namespace_adjustment**=false
+Reject NRI plugin adjustment of linux namespaces.
+
+**nri_validator_required_plugins**=[]
+List of required NRI plugins that must be present.
+
+**nri_validator_tolerate_missing_plugins_annotation**=""
+Name of the annotation used to indicate toleration of missing required NRI plugins.
 
 # SEE ALSO
 

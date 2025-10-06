@@ -12,8 +12,8 @@ import (
 	"github.com/containers/storage/pkg/unshare"
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
-	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
+	"github.com/opencontainers/cgroups"
+	"github.com/opencontainers/cgroups/systemd"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -42,10 +42,10 @@ type SystemdManager struct {
 func NewSystemdManager() *SystemdManager {
 	systemdMgr := SystemdManager{}
 	if node.CgroupIsV2() {
-		systemdMgr.memoryPath = cgroupMemoryPathV2
+		systemdMgr.memoryPath = CgroupMemoryPathV2
 		systemdMgr.memoryMaxFile = cgroupMemoryMaxFileV2
 	} else {
-		systemdMgr.memoryPath = cgroupMemoryPathV1
+		systemdMgr.memoryPath = CgroupMemoryPathV1
 		systemdMgr.memoryMaxFile = cgroupMemoryMaxFileV1
 		systemdMgr.v1CtrCgMgr = make(map[string]cgroups.Manager)
 		systemdMgr.v1SbCgMgr = make(map[string]cgroups.Manager)
@@ -146,6 +146,7 @@ func (m *SystemdManager) RemoveContainerCgManager(containerID string) {
 	if !node.CgroupIsV2() {
 		m.mutex.Lock()
 		defer m.mutex.Unlock()
+
 		delete(m.v1CtrCgMgr, containerID)
 	}
 }
@@ -296,6 +297,7 @@ func (m *SystemdManager) RemoveSandboxCgManager(sbID string) {
 	if !node.CgroupIsV2() {
 		m.mutex.Lock()
 		defer m.mutex.Unlock()
+
 		delete(m.v1SbCgMgr, sbID)
 	}
 }

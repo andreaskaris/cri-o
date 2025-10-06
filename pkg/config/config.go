@@ -17,6 +17,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/containers/common/pkg/hooks"
+	conmonrsClient "github.com/containers/conmon-rs/pkg/client"
 	"github.com/containers/image/v5/pkg/sysregistriesv2"
 	"github.com/containers/image/v5/types"
 	"github.com/containers/storage"
@@ -26,6 +27,7 @@ import (
 	selinux "github.com/opencontainers/selinux/go-selinux"
 	"github.com/sirupsen/logrus"
 	"k8s.io/utils/cpuset"
+	"k8s.io/utils/ptr"
 	"tags.cncf.io/container-device-interface/pkg/cdi"
 
 	"github.com/cri-o/cri-o/internal/config/apparmor"
@@ -271,7 +273,40 @@ type RuntimeHandler struct {
 	// Default annotations specified for runtime handler if they're not overridden by
 	// the pod spec.
 	DefaultAnnotations map[string]string `toml:"default_annotations,omitempty"`
+
+	// StreamWebsockets can be used to enable the WebSocket protocol for
+	// container exec, attach and port forward.
+	//
+	// conmon-rs (runtime_type = "pod") supports this configuration for exec
+	// and attach. Forwarding ports will be supported in future releases.
+	StreamWebsockets bool `toml:"stream_websockets,omitempty"`
+
+	// ExecCPUAffinity specifies which CPU is used when exec-ing the container.
+	// The valid values are:
+	// "":
+	//   Use runtime default.
+	// "first":
+	//   When it has only exclusive cpuset, use the first CPU in the exclusive cpuset.
+	//   When it has both shared and exclusive cpusets, use first CPU in the shared cpuset.
+	ExecCPUAffinity ExecCPUAffinityType `toml:"exec_cpu_affinity,omitempty"`
+
+	// SeccompProfile is the absolute path of the seccomp.json profile which is used as the
+	// default for the runtime. This configuration takes precedence over runtime config seccomp_profile.
+	// If set to "", the runtime config seccomp_profile will be used.
+	// If that is also set to "", the internal default seccomp profile will be applied.
+	SeccompProfile string `toml:"seccomp_profile,omitempty"`
+
+	// seccompConfig is the seccomp configuration for the handler.
+	seccompConfig *seccomp.Config
 }
+
+type ExecCPUAffinityType string
+
+const (
+	ExecCPUAffinityTypeDefault   ExecCPUAffinityType = ""
+	ExecCPUAffinityTypeFirst     ExecCPUAffinityType = "first"
+	runtimeSeccompProfileDefault string              = ""
+)
 
 // Multiple runtime Handlers in a map.
 type Runtimes map[string]*RuntimeHandler
@@ -355,6 +390,7 @@ type RuntimeConfig struct {
 
 	// SeccompProfile is the seccomp.json profile path which is used as the
 	// default for the runtime.
+	// If set to "" or not found, the internal default seccomp profile will be used.
 	SeccompProfile string `toml:"seccomp_profile"`
 
 	// PrivilegedSeccompProfile can be set to enable a seccomp profile for
@@ -532,6 +568,18 @@ type ImageConfig struct {
 	// containing credentials necessary for pulling images from secure
 	// registries.
 	GlobalAuthFile string `toml:"global_auth_file"`
+	// NamespacedAuthDir is the root path for pod namespace-separated
+	// auth files, which is intended to be used together with CRI-O's credential provider:
+	// https://github.com/cri-o/credential-provider
+	// The final auth file will be <NAMESPACED_AUTH_DIR>/<NAMESPACE>-<IMAGE_NAME_SHA256>.json.
+	// The image name does not contain any specific tag or digest, only the normalized repository
+	// as well as the image name.
+	// This temporary auth file will be used instead of any configured GlobalAuthFile.
+	// If no pod namespace is being provided on image pull (via the sandbox
+	// config), or the concatenated path is non existent, then the system wide
+	// auth file will be used as fallback.
+	// Must be an absolute path.
+	NamespacedAuthDir string `toml:"namespaced_auth_dir"`
 	// PauseImage is the name of an image on a registry which we use to instantiate infra
 	// containers. It should start with a registry host name.
 	// Format is enforced by validation.
@@ -564,6 +612,7 @@ type ImageConfig struct {
 	SignaturePolicyDir string `toml:"signature_policy_dir"`
 	// InsecureRegistries is a list of registries that must be contacted w/o
 	// TLS verification.
+	// Deprecated: use `insecure` in `registries.conf` instead.
 	InsecureRegistries []string `toml:"insecure_registries"`
 	// ImageVolumes controls how volumes specified in image config are handled
 	ImageVolumes ImageVolumesType `toml:"image_volumes"`
@@ -580,6 +629,11 @@ type ImageConfig struct {
 	PullProgressTimeout time.Duration `toml:"pull_progress_timeout"`
 	// OCIArtifactMountSupport is used to determine if CRI-O should support OCI Artifacts.
 	OCIArtifactMountSupport bool `toml:"oci_artifact_mount_support"`
+	// ShortNameMode describes the mode of short name resolution.
+	// The valid values are "enforcing" and "disabled".
+	// If "enforcing", an image pull will fail if a short name is used, but the results are ambiguous.
+	// If "disabled", the first result will be chosen.
+	ShortNameMode string `toml:"short_name_mode"`
 }
 
 // NetworkConfig represents the "crio.network" TOML config table.
@@ -710,6 +764,11 @@ type tomlConfig struct {
 // SetSystemContext configures the SystemContext used by containers/image library.
 func (t *tomlConfig) SetSystemContext(c *Config) {
 	c.SystemContext.BigFilesTemporaryDir = c.BigFilesTemporaryDir
+	c.SystemContext.ShortNameMode = ptr.To(types.ShortNameModeEnforcing)
+
+	if c.ShortNameMode == "disabled" {
+		c.SystemContext.ShortNameMode = ptr.To(types.ShortNameModeDisabled)
+	}
 }
 
 func (t *tomlConfig) toConfig(c *Config) {
@@ -766,6 +825,7 @@ func (c *Config) UpdateFromDropInFile(ctx context.Context, path string) error {
 	log.Infof(ctx, configLogPrefix+"drop-in file: %s", path)
 	// keeps the storage options from storage.conf and merge it to crio config
 	var storageOpts []string
+
 	storageOpts = append(storageOpts, c.StorageOptions...)
 	// storage configurations from storage.conf, if crio config has no values for these, they will be merged to crio config
 	graphRoot := c.Root
@@ -883,6 +943,7 @@ func (c *Config) ToString() (string, error) {
 // fails, which should never happen at all because of general type safeness.
 func (c *Config) ToBytes() ([]byte, error) {
 	var buffer bytes.Buffer
+
 	e := toml.NewEncoder(&buffer)
 
 	tc := tomlConfig{}
@@ -943,6 +1004,8 @@ func DefaultConfig() (*Config, error) {
 			SignaturePolicyDir:      "/etc/crio/policies",
 			PullProgressTimeout:     0,
 			OCIArtifactMountSupport: true,
+			ShortNameMode:           "enforcing",
+			NamespacedAuthDir:       "/etc/crio/auth",
 		},
 		NetworkConfig: NetworkConfig{
 			NetworkDir: cniConfigDir,
@@ -1036,6 +1099,14 @@ func (c *Config) Validate(onExecution bool) error {
 	c.seccompConfig.SetNotifierPath(
 		filepath.Join(filepath.Dir(c.Listen), "seccomp"),
 	)
+
+	for name := range c.Runtimes {
+		if c.Runtimes[name].seccompConfig != nil {
+			c.Runtimes[name].seccompConfig.SetNotifierPath(
+				filepath.Join(filepath.Dir(c.Listen), "seccomp"),
+			)
+		}
+	}
 
 	if err := c.ImageConfig.Validate(onExecution); err != nil {
 		return fmt.Errorf("validating image config: %w", err)
@@ -1283,15 +1354,20 @@ func (c *RuntimeConfig) Validate(systemContext *types.SystemContext, onExecution
 			logrus.Infof("Checkpoint/restore support disabled via configuration")
 		}
 
-		if err := c.seccompConfig.LoadProfile(c.SeccompProfile); err != nil {
+		if c.SeccompProfile == "" {
+			if err := c.seccompConfig.LoadDefaultProfile(); err != nil {
+				return fmt.Errorf("unable to load default seccomp profile: %w", err)
+			}
+		} else if err := c.seccompConfig.LoadProfile(c.SeccompProfile); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("unable to load seccomp profile: %w", err)
 			}
 
-			logrus.Info("Specified profile does not exist on disk")
+			// Fallback to the internal default in order not to break upgrade paths.
+			logrus.Info("Seccomp profile does not exist on disk, fallback to internal default profile")
 
 			if err := c.seccompConfig.LoadDefaultProfile(); err != nil {
-				return fmt.Errorf("load default seccomp profile: %w", err)
+				return fmt.Errorf("unable to load default seccomp profile: %w", err)
 			}
 		}
 
@@ -1366,6 +1442,8 @@ func defaultRuntimeHandler(isSystemd bool) *RuntimeHandler {
 		},
 		ContainerMinMemory: units.BytesSize(defaultContainerMinMemoryCrun),
 		MonitorCgroup:      getDefaultMonitorGroup(isSystemd),
+		ExecCPUAffinity:    ExecCPUAffinityTypeDefault,
+		SeccompProfile:     runtimeSeccompProfileDefault,
 	}
 }
 
@@ -1629,18 +1707,29 @@ func validateExecutablePath(executable, currentPath string) (string, error) {
 // Validate is the main entry point for image configuration validation.
 // It returns an error on validation failure, otherwise nil.
 func (c *ImageConfig) Validate(onExecution bool) error {
-	if !filepath.IsAbs(c.SignaturePolicyDir) {
-		return fmt.Errorf("signature policy dir %q is not absolute", c.SignaturePolicyDir)
+	for key, value := range map[string]string{
+		"signature policy": c.SignaturePolicyDir,
+		"namespaced auth":  c.NamespacedAuthDir,
+	} {
+		if !filepath.IsAbs(value) {
+			return fmt.Errorf("%s dir %q is not absolute", key, value)
+		}
+
+		if onExecution {
+			if err := os.MkdirAll(value, 0o755); err != nil {
+				return fmt.Errorf("cannot create %s dir: %w", key, err)
+			}
+		}
 	}
 
 	if _, err := c.ParsePauseImage(); err != nil {
 		return fmt.Errorf("invalid pause image %q: %w", c.PauseImage, err)
 	}
 
-	if onExecution {
-		if err := os.MkdirAll(c.SignaturePolicyDir, 0o755); err != nil {
-			return fmt.Errorf("cannot create signature policy dir: %w", err)
-		}
+	switch c.ShortNameMode {
+	case "enforcing", "disabled", "":
+	default:
+		return fmt.Errorf("invalid short name mode %q", c.ShortNameMode)
 	}
 
 	return nil
@@ -1725,7 +1814,23 @@ func (r *RuntimeHandler) Validate(name string) error {
 		logrus.Errorf("Unable to set minimum container memory for runtime handler %q: %v", name, err)
 	}
 
-	return r.ValidateNoSyncLog()
+	if err := r.ValidateNoSyncLog(); err != nil {
+		return fmt.Errorf("no sync log: %w", err)
+	}
+
+	if err := r.ValidateWebsocketStreaming(name); err != nil {
+		return fmt.Errorf("websocket streaming: %w", err)
+	}
+
+	if err := r.validateRuntimeExecCPUAffinity(); err != nil {
+		return err
+	}
+
+	if err := r.validateRuntimeSeccompProfile(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (r *RuntimeHandler) ValidateRuntimeVMBinaryPattern() bool {
@@ -1851,6 +1956,47 @@ func (r *RuntimeHandler) ValidateContainerMinMemory(name string) error {
 	return nil
 }
 
+// ValidateWebsocketStreaming can be used to verify if the runtime supports WebSocket streaming.
+func (r *RuntimeHandler) ValidateWebsocketStreaming(name string) error {
+	if r.RuntimeType != RuntimeTypePod {
+		if r.StreamWebsockets {
+			return fmt.Errorf(`only the 'runtime_type = "pod"' supports websocket streaming, not %q (runtime %q)`, r.RuntimeType, name)
+		}
+
+		return nil
+	}
+
+	// Requires at least conmon-rs v0.7.0
+	v, err := conmonrsClient.Version(r.MonitorPath)
+	if err != nil {
+		if errors.Is(err, conmonrsClient.ErrUnsupported) {
+			logrus.Debugf("Unable to verify pod runtime version: %v", err)
+
+			// Streaming server support got introduced in v0.7.0
+			if r.StreamWebsockets {
+				logrus.Warnf("Disabling streaming over websockets, it requires conmon-rs >= v0.7.0")
+
+				r.StreamWebsockets = false
+			}
+
+			return nil
+		}
+
+		return fmt.Errorf("get conmon-rs version: %w", err)
+	}
+
+	if v.Tag == "" {
+		v.Tag = "none"
+	}
+
+	logrus.Infof(
+		"Runtime handler %q is using conmon-rs version: %s, tag: %s, commit: %s, build: %s, target: %s, %s, %s",
+		name, v.Version, v.Tag, v.Commit, v.BuildDate, v.Target, v.RustVersion, v.CargoVersion,
+	)
+
+	return nil
+}
+
 // LoadRuntimeFeatures loads features for a given runtime handler using the "features"
 // sub-command output, where said output contains a JSON document called "Features
 // Structure" that describes the runtime handler's supported features.
@@ -1901,6 +2047,42 @@ func (r *RuntimeHandler) RuntimeSupportsMountFlag(flag string) bool {
 // RuntimeDefaultAnnotations returns the default annotations for this handler.
 func (r *RuntimeHandler) RuntimeDefaultAnnotations() map[string]string {
 	return r.DefaultAnnotations
+}
+
+// RuntimeStreamWebsockets returns the configured websocket streaming option for this handler.
+func (r *RuntimeHandler) RuntimeStreamWebsockets() bool {
+	return r.StreamWebsockets
+}
+
+// RuntimeSeccomp returns the configuration of the loaded seccomp profile for this handler.
+func (r *RuntimeHandler) RuntimeSeccomp() *seccomp.Config {
+	return r.seccompConfig
+}
+
+// validateRuntimeExecCPUAffinity checks if the RuntimeHandler enforces proper CPU affinity settings.
+func (r *RuntimeHandler) validateRuntimeExecCPUAffinity() error {
+	switch r.ExecCPUAffinity {
+	case ExecCPUAffinityTypeDefault, ExecCPUAffinityTypeFirst:
+		return nil
+	}
+
+	return fmt.Errorf("invalid exec_cpu_affinity %q", r.ExecCPUAffinity)
+}
+
+// validateRuntimeSeccompProfile tries to load the RuntimeHandler seccomp profile.
+func (r *RuntimeHandler) validateRuntimeSeccompProfile() error {
+	if r.SeccompProfile == "" {
+		r.seccompConfig = nil
+
+		return nil
+	}
+
+	r.seccompConfig = seccomp.New()
+	if err := r.seccompConfig.LoadProfile(r.SeccompProfile); err != nil {
+		return fmt.Errorf("unable to load runtime handler seccomp profile: %w", err)
+	}
+
+	return nil
 }
 
 func validateAllowedAndGenerateDisallowedAnnotations(allowed []string) (disallowed []string, _ error) {

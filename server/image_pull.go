@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -11,9 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/containers/image/v5/docker/reference"
 	imageTypes "github.com/containers/image/v5/types"
 	encconfig "github.com/containers/ocicrypt/config"
 	"github.com/docker/distribution/registry/api/errcode"
+	"github.com/google/uuid"
 	"github.com/opencontainers/go-digest"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
 	crierrors "k8s.io/cri-api/pkg/errors"
@@ -32,33 +35,33 @@ func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*t
 	var err error
 
 	image := ""
-	img := req.Image
+	img := req.GetImage()
 
 	if img != nil {
-		image = img.Image
+		image = img.GetImage()
 	}
 
 	log.Infof(ctx, "Pulling image: %s", image)
 
 	pullArgs := pullArguments{image: image}
 
-	sc := req.SandboxConfig
+	sc := req.GetSandboxConfig()
 	if sc != nil {
-		if sc.Linux != nil {
-			pullArgs.sandboxCgroup = sc.Linux.CgroupParent
+		if sc.GetLinux() != nil {
+			pullArgs.sandboxCgroup = sc.GetLinux().GetCgroupParent()
 		}
 
-		if sc.Metadata != nil {
-			pullArgs.namespace = sc.Metadata.Namespace
+		if sc.GetMetadata() != nil {
+			pullArgs.namespace = sc.GetMetadata().GetNamespace()
 		}
 	}
 
-	if req.Auth != nil {
-		username := req.Auth.Username
-		password := req.Auth.Password
+	if req.GetAuth() != nil {
+		username := req.GetAuth().GetUsername()
+		password := req.GetAuth().GetPassword()
 
-		if req.Auth.Auth != "" {
-			username, password, err = decodeDockerAuth(req.Auth.Auth)
+		if req.GetAuth().GetAuth() != "" {
+			username, password, err = decodeDockerAuth(req.GetAuth().GetAuth())
 			if err != nil {
 				log.Debugf(ctx, "Error decoding authentication for image %s: %v", image, err)
 
@@ -97,6 +100,7 @@ func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*t
 
 	if !pullInProcess {
 		pullOp.err = errors.New("pullImage was aborted by a Go panic")
+
 		defer func() {
 			s.pullOperationsLock.Lock()
 			delete(s.pullOperationsInProgress, pullArgs)
@@ -139,6 +143,12 @@ func (s *Server) pullImage(ctx context.Context, pullArgs *pullArguments) (storag
 	if err != nil {
 		return storage.RegistryImageReference{}, fmt.Errorf("get context for namespace: %w", err)
 	}
+
+	authCleanup, err := s.prepareTempAuthFile(ctx, &sourceCtx, pullArgs.image, pullArgs.namespace)
+	if err != nil {
+		return storage.RegistryImageReference{}, fmt.Errorf("prepare temp auth file: %w", err)
+	}
+	defer authCleanup()
 
 	log.Debugf(ctx, "Using pull policy path for image %s: %q", pullArgs.image, sourceCtx.SignaturePolicyPath)
 
@@ -206,18 +216,67 @@ func (s *Server) pullImage(ctx context.Context, pullArgs *pullArguments) (storag
 // contextForNamespace takes the provided namespace and returns a modifiable
 // copy of the servers system context.
 func (s *Server) contextForNamespace(namespace string) (imageTypes.SystemContext, error) {
-	ctx := *s.config.SystemContext // A shallow copy we can modify
+	sysCtx := *s.config.SystemContext // A shallow copy we can modify
 
 	if namespace != "" {
 		policyPath := filepath.Join(s.config.SignaturePolicyDir, namespace+".json")
 		if _, err := os.Stat(policyPath); err == nil {
-			ctx.SignaturePolicyPath = policyPath
+			sysCtx.SignaturePolicyPath = policyPath
 		} else if !os.IsNotExist(err) {
-			return ctx, fmt.Errorf("read policy path %s: %w", policyPath, err)
+			return sysCtx, fmt.Errorf("read policy path %s: %w", policyPath, err)
 		}
 	}
 
-	return ctx, nil
+	return sysCtx, nil
+}
+
+// prepareTempAuthFile checks is a namespaced auth file is available for the
+// provided imageRef and namespace. If that's the case, then it moves it to a
+// temporary location for singular usage, modifies the provided system context
+// and returns a cleanup function to remove the file if the pull has been done.
+func (s *Server) prepareTempAuthFile(ctx context.Context, sysCtx *imageTypes.SystemContext, imageRef, namespace string) (cleanup func(), err error) {
+	cleanup = func() {}
+
+	// Normalize the image ref to use the same format as the credential provider, see:
+	// https://github.com/kubernetes/kubernetes/blob/6070f5a/pkg/kubelet/images/image_manager.go#L192-L195
+	// which calls into:
+	// https://github.com/kubernetes/kubernetes/blob/6070f5a/pkg/util/parsers/parsers.go#L29-L37
+	image, err := reference.ParseNormalizedNamed(imageRef)
+	if err != nil {
+		return cleanup, fmt.Errorf("parse image name: %w", err)
+	}
+
+	// Follow the strict format of <NAMESPACE>-<IMAGE_NAME_SHA256>.json to resolve possible auth files.
+	hash := sha256.Sum256([]byte(image.Name()))
+	authFilePath := filepath.Join(s.config.NamespacedAuthDir, fmt.Sprintf("%s-%x.json", namespace, hash))
+	log.Debugf(ctx, "Looking for namespaced auth JSON file in: %s", authFilePath)
+
+	if _, err := os.Stat(authFilePath); err != nil {
+		return cleanup, nil
+	}
+
+	log.Infof(ctx, "Using auth file for namespace %s: %s", namespace, authFilePath)
+
+	inUseAuthDirPath := filepath.Join(s.config.NamespacedAuthDir, "in-use")
+	if err := os.MkdirAll(inUseAuthDirPath, 0o700); err != nil {
+		return cleanup, fmt.Errorf("unable to ensure in-use auth dir: %w", err)
+	}
+
+	tempAuthFilePath := filepath.Join(inUseAuthDirPath, fmt.Sprintf("%s-%x-%s.json", namespace, hash, uuid.New()))
+	if err := os.Rename(authFilePath, tempAuthFilePath); err != nil {
+		return cleanup, fmt.Errorf("unable to move auth file path to temporary location: %w", err)
+	}
+
+	sysCtx.AuthFilePath = tempAuthFilePath
+	cleanup = func() {
+		if err := os.RemoveAll(tempAuthFilePath); err != nil {
+			log.Warnf(ctx, "Unable to remove auth file: %s", tempAuthFilePath)
+		} else {
+			log.Debugf(ctx, "Removed temp auth file: %s", tempAuthFilePath)
+		}
+	}
+
+	return cleanup, nil
 }
 
 func (s *Server) pullImageCandidate(ctx context.Context, sourceCtx *imageTypes.SystemContext, remoteCandidateName storage.RegistryImageReference, decryptConfig *encconfig.DecryptConfig, cgroup string) (storage.RegistryImageReference, error) {
@@ -265,6 +324,7 @@ func consumeImagePullProgress(ctx context.Context, cancel context.CancelFunc, pu
 			cancel()
 		}
 	})
+
 	timer.Stop()       // don't start the timer immediately
 	defer timer.Stop() // ensure that the timer is stopped when we exit the progress loop
 
@@ -304,6 +364,7 @@ func consumeImagePullProgress(ctx context.Context, cancel context.CancelFunc, pu
 func tryIncrementImagePullFailureMetric(img storage.RegistryImageReference, err error) {
 	// We try to cover some basic use-cases
 	const labelUnknown = "UNKNOWN"
+
 	label := labelUnknown
 
 	// Docker registry errors

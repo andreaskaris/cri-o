@@ -29,7 +29,6 @@ var _ = t.Describe("Image", func() {
 		testDockerRegistry                  = "docker.io"
 		testQuayRegistry                    = "quay.io"
 		testRedHatRegistry                  = "registry.access.redhat.com"
-		testFedoraRegistry                  = "registry.fedoraproject.org"
 		testImageName                       = "image"
 		testImageAlias                      = "image-for-testing"
 		testImageAliasResolved              = "registry.crio.test.com/repo"
@@ -183,7 +182,8 @@ var _ = t.Describe("Image", func() {
 			// When
 			refs, err := sut.CandidatesForPotentiallyShortImageName(
 				&types.SystemContext{
-					SystemRegistriesConfPath: "../../test/registries.conf",
+					SystemRegistriesConfPath:    "../../test/registries.conf",
+					SystemRegistriesConfDirPath: t.MustTempDir("registries.conf.d"),
 				},
 				testImageName,
 			)
@@ -193,7 +193,6 @@ var _ = t.Describe("Image", func() {
 			Expect(refsToNames(refs)).To(Equal([]string{
 				testQuayRegistry + "/" + testImageName + ":latest",
 				testRedHatRegistry + "/" + testImageName + ":latest",
-				testFedoraRegistry + "/" + testImageName + ":latest",
 				testDockerRegistry + "/library/" + testImageName + ":latest",
 			}))
 		})
@@ -238,7 +237,8 @@ var _ = t.Describe("Image", func() {
 			// When
 			refs, err := sut.CandidatesForPotentiallyShortImageName(
 				&types.SystemContext{
-					SystemRegistriesConfPath: "../../test/registries.conf",
+					SystemRegistriesConfPath:    "../../test/registries.conf",
+					SystemRegistriesConfDirPath: t.MustTempDir("registries.conf.d"),
 				},
 				testImageWithTagAndDigest,
 			)
@@ -247,7 +247,6 @@ var _ = t.Describe("Image", func() {
 			Expect(refsToNames(refs)).To(Equal([]string{
 				testQuayRegistry + "/" + testImageName + "@sha256:" + testSHA256,
 				testRedHatRegistry + "/" + testImageName + "@sha256:" + testSHA256,
-				testFedoraRegistry + "/" + testImageName + "@sha256:" + testSHA256,
 				testDockerRegistry + "/library/" + testImageName + "@sha256:" + testSHA256,
 			}))
 		})
@@ -296,7 +295,8 @@ var _ = t.Describe("Image", func() {
 			// When
 			refs, err := sut.CandidatesForPotentiallyShortImageName(
 				&types.SystemContext{
-					SystemRegistriesConfPath: "/dev/null",
+					SystemRegistriesConfPath:    "/dev/null",
+					SystemRegistriesConfDirPath: t.MustTempDir("registries.conf.d"),
 				},
 				testImageName,
 			)
@@ -668,12 +668,12 @@ var _ = t.Describe("Image", func() {
 
 	t.Describe("CompileRegexpsForPinnedImages", func() {
 		It("should return regexps for exact patterns", func() {
-			patterns := []string{"quay.io/crio/pause:latest", "docker.io/crio/sandbox:latest", "registry.k8s.io/pause:3.10"}
+			patterns := []string{"quay.io/crio/pause:latest", "docker.io/crio/sandbox:latest", "registry.k8s.io/pause:3.10.1"}
 			regexps := storage.CompileRegexpsForPinnedImages(patterns)
 			Expect(regexps).To(HaveLen(len(patterns)))
 			Expect(regexps[0].MatchString("quay.io/crio/pause:latest")).To(BeTrue())
 			Expect(regexps[1].MatchString("docker.io/crio/sandbox:latest")).To(BeTrue())
-			Expect(regexps[2].MatchString("registry.k8s.io/pause:3.10")).To(BeTrue())
+			Expect(regexps[2].MatchString("registry.k8s.io/pause:3.10.1")).To(BeTrue())
 		})
 
 		It("should return regexps for keyword patterns", func() {

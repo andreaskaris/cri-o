@@ -72,6 +72,7 @@ func (ss *StatsServer) updateLoop() {
 			return
 		case <-time.After(ss.collectionPeriod):
 		}
+
 		ss.update()
 	}
 }
@@ -91,13 +92,13 @@ func (ss *StatsServer) update() {
 // updateUsageNanoCores calculates the usage nano cores by averaging the CPU usage between the timestamps
 // of the old usage and the recently gathered usage.
 func updateUsageNanoCores(old, current *types.CpuUsage) {
-	if old == nil || current == nil || old.UsageCoreNanoSeconds == nil || current.UsageCoreNanoSeconds == nil {
+	if old == nil || current == nil || old.GetUsageCoreNanoSeconds() == nil || current.GetUsageCoreNanoSeconds() == nil {
 		return
 	}
 
-	nanoSeconds := current.Timestamp - old.Timestamp
+	nanoSeconds := current.GetTimestamp() - old.GetTimestamp()
 
-	usageNanoCores := uint64(float64(current.UsageCoreNanoSeconds.Value-old.UsageCoreNanoSeconds.Value) /
+	usageNanoCores := uint64(float64(current.GetUsageCoreNanoSeconds().GetValue()-old.GetUsageCoreNanoSeconds().GetValue()) /
 		float64(nanoSeconds) * float64(time.Second/time.Nanosecond))
 
 	current.UsageNanoCores = &types.UInt64Value{
@@ -188,6 +189,7 @@ func (ss *StatsServer) statsForSandbox(sb *sandbox.Sandbox) *types.PodSandboxSta
 func (ss *StatsServer) RemoveStatsForSandbox(sb *sandbox.Sandbox) {
 	ss.mutex.Lock()
 	defer ss.mutex.Unlock()
+
 	delete(ss.sboxStats, sb.ID())
 }
 
@@ -242,6 +244,7 @@ func (ss *StatsServer) statsForContainer(c *oci.Container, sb *sandbox.Sandbox) 
 func (ss *StatsServer) RemoveStatsForContainer(c *oci.Container) {
 	ss.mutex.Lock()
 	defer ss.mutex.Unlock()
+
 	delete(ss.ctrStats, c.ID())
 }
 
@@ -284,5 +287,6 @@ func (ss *StatsServer) MetricsForPodSandboxList(sboxes []*sandbox.Sandbox) []*Sa
 func (ss *StatsServer) RemoveMetricsForPodSandbox(sb *sandbox.Sandbox) {
 	ss.mutex.Lock()
 	defer ss.mutex.Unlock()
+
 	delete(ss.sboxMetrics, sb.ID())
 }
